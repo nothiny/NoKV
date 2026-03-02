@@ -973,6 +973,14 @@ func (lm *levelManager) updateDiscardStats(discardStats map[manifest.ValueLogID]
 	}
 }
 
+// rangeTombstone represents a copied range tombstone for compaction.
+type rangeTombstone struct {
+	cf      kv.ColumnFamily
+	start   []byte
+	end     []byte
+	version uint64
+}
+
 // subcompact runs a single parallel compaction over a key range.
 func (lm *levelManager) subcompact(it utils.Iterator, kr compact.KeyRange, cd compactDef,
 	inflightBuilders *utils.Throttle, res chan<- *table) {
@@ -997,10 +1005,13 @@ func (lm *levelManager) subcompact(it utils.Iterator, kr compact.KeyRange, cd co
 			discardStats[manifest.ValueLogID{Bucket: vp.Bucket, FileID: vp.Fid}] += int64(math.Round(weighted))
 		}
 	}
+
+	// Keep tombstone state across builder splits.
+	var rangeTombstones []rangeTombstone
+	isMaxLevel := cd.nextLevel != nil && cd.nextLevel.levelNum == lm.opt.MaxLevelNum
+
 	addKeys := func(builder *tableBuilder) {
 		var tableKr compact.KeyRange
-		var rangeTombstones []*kv.Entry
-		isMaxLevel := cd.nextLevel != nil && cd.nextLevel.levelNum == lm.opt.MaxLevelNum
 
 		for ; it.Valid(); it.Next() {
 			entry := it.Item().Entry()
@@ -1012,7 +1023,15 @@ func (lm *levelManager) subcompact(it utils.Iterator, kr compact.KeyRange, cd co
 					updateStats(entry)
 					continue
 				}
-				rangeTombstones = append(rangeTombstones, entry)
+				// Copy range tombstone data to avoid iterator reuse issues.
+				cf, rtStart, rtVersion := kv.SplitInternalKey(entry.Key)
+				rt := rangeTombstone{
+					cf:      cf,
+					start:   kv.SafeCopy(nil, rtStart),
+					end:     kv.SafeCopy(nil, entry.RangeEnd()),
+					version: rtVersion,
+				}
+				rangeTombstones = append(rangeTombstones, rt)
 			}
 
 			if !kv.SameKey(key, lastKey) {
@@ -1031,10 +1050,10 @@ func (lm *levelManager) subcompact(it utils.Iterator, kr compact.KeyRange, cd co
 
 			if !entry.IsRangeDelete() {
 				covered := false
-				_, userKey, version := kv.SplitInternalKey(key)
+				cf, userKey, version := kv.SplitInternalKey(key)
 				for _, rt := range rangeTombstones {
-					_, rtStart, rtVersion := kv.SplitInternalKey(rt.Key)
-					if rtVersion >= version && kv.KeyInRange(userKey, rtStart, rt.RangeEnd()) {
+					// Check CF match and version/range coverage.
+					if rt.cf == cf && rt.version >= version && kv.KeyInRange(userKey, rt.start, rt.end) {
 						covered = true
 						updateStats(entry)
 						break
