@@ -37,10 +37,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-de60993c.js";
+            window.path_to_searchindex_js = "searchindex-f5b0fed8.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-cbc9e846.js"></script>
+        <script src="toc-56d2c64c.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -349,7 +349,7 @@ Pebble  YCSB-A 1282218  YCSB-B 1941330  YCSB-C 847764   YCSB-D 2509809  YCSB-E 5
 <li>(Optional) Docker + Docker Compose for containerized runs</li>
 </ul>
 <h2 id="option-a-local-cluster-recommended-for-dev"><a class="header" href="#option-a-local-cluster-recommended-for-dev">Option A: Local Cluster (recommended for dev)</a></h2>
-<p>This launches a 3-node Raft cluster plus the optional TSO helper.</p>
+<p>This launches a 3-node Raft cluster plus a PD-lite service.</p>
 <pre><code class="language-bash">./scripts/run_local_cluster.sh --config ./raft_config.example.json
 </code></pre>
 <p>Start the Redis-compatible gateway in another shell:</p>
@@ -399,7 +399,7 @@ func main() {
 }
 </code></pre>
 <blockquote>
-<p>Note: Public read APIs (<code>DB.Get</code>, <code>DB.GetCF</code>, <code>DB.GetVersionedEntry</code>, <code>Txn.Get</code>) return detached entries. Do not call <code>DecrRef</code> on them.</p>
+<p>Note: <code>DB.Get</code> returns detached entries (do not call <code>DecrRef</code>). <code>DB.GetInternalEntry</code> returns borrowed entries and callers must call <code>DecrRef</code> exactly once.</p>
 </blockquote>
 <h2 id="benchmarks"><a class="header" href="#benchmarks">Benchmarks</a></h2>
 <p>Micro benchmarks:</p>
@@ -476,6 +476,7 @@ func main() {
 <ul>
 <li><strong>Embedded mode</strong> uses <code>NoKV.Open</code> directly: WAL→MemTable→SST durability, ValueLog separation, MVCC semantics, rich stats.</li>
 <li><strong>Distributed mode</strong> layers <code>raftstore</code> on top: multi-Raft regions reuse the same WAL/Manifest, expose metrics, and serve TinyKv RPCs.</li>
+<li><strong>Control plane split</strong>: <code>raft_config</code> provides bootstrap topology; PD provides runtime routing/TSO/control-plane state in cluster mode.</li>
 <li><strong>Clients</strong> obtain leader-aware routing, automatic NotLeader/EpochNotMatch retries, and two-phase commit helpers.</li>
 </ul>
 <hr>
@@ -516,11 +517,11 @@ func main() {
   Ingest --&gt;|IngestKeep: ingest-merge| Ingest
 </pre>
 
-<h3 id="25-mvcc"><a class="header" href="#25-mvcc">2.5 MVCC</a></h3>
+<h3 id="25-distributed-transaction-path"><a class="header" href="#25-distributed-transaction-path">2.5 Distributed Transaction Path</a></h3>
 <ul>
-<li><code>txn.go</code> exposes MVCC transactions with timestamps from <code>oracle</code>.</li>
-<li><code>percolator</code> package implements Prewrite/Commit/ResolveLock/CheckTxnStatus; <code>kv.Apply</code> simply dispatches Raft commands to these helpers.</li>
-<li>Watermarks (<code>utils.WaterMark</code>) gate read snapshots and commit visibility. They have no background goroutine; waiters block on per-index channels while advancement uses a mutex + atomics.</li>
+<li><code>percolator</code> implements Prewrite/Commit/ResolveLock/CheckTxnStatus; <code>kv.Apply</code> dispatches raft commands to these helpers.</li>
+<li>MVCC timestamps come from the distributed client/PD TSO flow, not from an embedded standalone transaction API.</li>
+<li>Watermarks (<code>utils.WaterMark</code>) are used in durability/visibility coordination; they have no background goroutine and advance via mutex + atomics.</li>
 </ul>
 <h3 id="26-write-pipeline--backpressure"><a class="header" href="#26-write-pipeline--backpressure">2.6 Write Pipeline &amp; Backpressure</a></h3>
 <ul>
@@ -538,7 +539,8 @@ func main() {
 </thead>
 <tbody>
 <tr><td><code>kv.Entry</code> (pooled)</td><td>internal write/read pipelines</td><td>codec iterator, memtable/lsm internal reads, request batches</td><td>Must call <code>DecrRef</code> exactly once per borrow.</td></tr>
-<tr><td><code>kv.Entry</code> (detached public result)</td><td>caller</td><td>none</td><td>Returned by <code>DB.Get/GetCF/GetVersionedEntry</code> and <code>Txn.Get</code>; <strong>must not</strong> call <code>DecrRef</code>.</td></tr>
+<tr><td><code>kv.Entry</code> (detached public result)</td><td>caller</td><td>none</td><td>Returned by <code>DB.Get</code>; <strong>must not</strong> call <code>DecrRef</code>.</td></tr>
+<tr><td><code>kv.Entry</code> (borrowed internal result)</td><td>caller</td><td>yes (<code>DecrRef</code>)</td><td>Returned by <code>DB.GetInternalEntry</code>; caller must release exactly once.</td></tr>
 <tr><td><code>request</code></td><td>commit queue/worker</td><td>waiter path (<code>Wait</code>)</td><td><code>IncrRef</code> on enqueue; <code>Wait</code> does one <code>DecrRef</code>; zero returns request to pool and releases entries.</td></tr>
 <tr><td><code>table</code></td><td>level/main+ingest lists, block cache</td><td>table iterators, prefetch workers</td><td>Removed tables are decremented once after manifest+in-memory swap; zero deletes SST.</td></tr>
 <tr><td><code>Skiplist</code> / <code>ART</code> index</td><td>memtable</td><td>iterators</td><td>Iterator creation increments index ref; iterator <code>Close</code> decrements; double-close is idempotent.</td></tr>
@@ -571,7 +573,7 @@ func main() {
 <li>Router registration, regionManager bookkeeping, optional <code>Peer.Bootstrap</code> with initial peer list, leader campaign.</li>
 </ul>
 </li>
-<li>Peers from other stores can be configured through <code>transport.SetPeer(storeID, addr)</code>, allowing dynamic updates from a scheduler.</li>
+<li>Peers from other stores can be configured through <code>transport.SetPeer(storeID, addr)</code>. In cluster mode, runtime routing/control-plane decisions come from PD.</li>
 </ol>
 <h3 id="32-command-paths"><a class="header" href="#32-command-paths">3.2 Command Paths</a></h3>
 <ul>
@@ -606,18 +608,18 @@ func main() {
 <h2 id="5-client-workflow"><a class="header" href="#5-client-workflow">5. Client Workflow</a></h2>
 <p><code>raftstore/client</code> offers a leader-aware client with retry logic and convenient helpers:</p>
 <ul>
-<li><strong>Initialization</strong>: provide <code>[]StoreEndpoint</code> + <code>[]RegionConfig</code> describing region boundaries and known leaders.</li>
+<li><strong>Initialization</strong>: provide <code>[]StoreEndpoint</code> + <code>RegionResolver</code> (<code>GetRegionByKey</code>) so runtime routing is PD-driven.</li>
 <li><strong>Reads</strong>: <code>Get</code> and <code>Scan</code> pick the leader store for a key range, issue TinyKv RPCs, and retry on NotLeader/EpochNotMatch.</li>
 <li><strong>Writes</strong>: <code>Mutate</code> bundles operations per region and drives Prewrite/Commit (primary first, secondaries after); <code>Put</code> and <code>Delete</code> are convenience wrappers using the same 2PC path.</li>
-<li><strong>Timestamps</strong>: clients must supply <code>startVersion</code>/<code>commitVersion</code>. For distributed demos, reuse the TSO sample under <code>scripts/tso</code> to obtain globally increasing values before calling <code>TwoPhaseCommit</code>.</li>
-<li><strong>Bootstrap helpers</strong>: <code>scripts/run_local_cluster.sh --config raft_config.example.json</code> builds the binaries, seeds manifests via <code>nokv-config manifest</code>, launches the stores declared in the config, and starts the HTTP TSO allocator when the <code>tso</code> block is present.</li>
+<li><strong>Timestamps</strong>: clients must supply <code>startVersion</code>/<code>commitVersion</code>. For distributed demos, use PD-lite (<code>nokv pd</code>) to obtain globally increasing values before calling <code>TwoPhaseCommit</code>.</li>
+<li><strong>Bootstrap helpers</strong>: <code>scripts/run_local_cluster.sh --config raft_config.example.json</code> builds the binaries, seeds manifests via <code>nokv-config manifest</code>, launches PD-lite, and starts the stores declared in the config.</li>
 </ul>
 <p><strong>Example (two regions)</strong></p>
 <ol>
 <li>Regions <code>[a,m)</code> and <code>[m,+∞)</code>, each led by a different store.</li>
 <li><code>Mutate(ctx, primary="alfa", mutations, startTs, commitTs, ttl)</code> prewrites and commits across the relevant regions.</li>
 <li><code>Get/Scan</code> retries automatically if the leader changes.</li>
-<li>See <code>raftstore/server/server_client_integration_test.go</code> for a full end-to-end example using real <code>raftstore.Server</code> instances.</li>
+<li>See <code>raftstore/server/server_test.go</code> for a full end-to-end example using real <code>raftstore.Server</code> instances.</li>
 </ol>
 <hr>
 <h2 id="6-failure-handling"><a class="header" href="#6-failure-handling">6. Failure Handling</a></h2>
@@ -629,9 +631,10 @@ func main() {
 <hr>
 <h2 id="7-observability--tooling"><a class="header" href="#7-observability--tooling">7. Observability &amp; Tooling</a></h2>
 <ul>
-<li><code>StatsSnapshot</code> publishes flush/compaction/WAL/VLog/txn/region metrics. <code>nokv stats</code> and the expvar endpoint expose the same data.</li>
+<li><code>StatsSnapshot</code> publishes flush/compaction/WAL/VLog/raft/region/hot/cache metrics. <code>nokv stats</code> and the expvar endpoint expose the same data.</li>
 <li><code>nokv regions</code> inspects Manifest-backed Region metadata.</li>
 <li><code>nokv serve</code> advertises Region samples on startup (ID, key range, peers) for quick verification.</li>
+<li>Inspect scheduler/control-plane state via PD APIs/metrics.</li>
 <li>Scripts:
 <ul>
 <li><code>scripts/run_local_cluster.sh</code> – launch a multi-node TinyKv cluster locally.</li>
@@ -643,11 +646,11 @@ func main() {
 <hr>
 <h2 id="8-when-to-use-nokv"><a class="header" href="#8-when-to-use-nokv">8. When to Use NoKV</a></h2>
 <ul>
-<li><strong>Embedded</strong>: call <code>NoKV.Open</code>, use the MVCC store locally.</li>
+<li><strong>Embedded</strong>: call <code>NoKV.Open</code>, use the local non-transactional DB APIs.</li>
 <li><strong>Distributed</strong>: deploy <code>nokv serve</code> nodes, use <code>raftstore/client</code> (or any TinyKv gRPC client) to perform reads, scans, and 2PC writes.</li>
 <li><strong>Observability-first</strong>: inspection via CLI or expvar is built-in; Region, WAL, Flush, and Raft metrics are accessible without extra instrumentation.</li>
 </ul>
-<p>See also <a href="#raftstore-deep-dive"><code>docs/raftstore.md</code></a> for deeper internals and <a href="#testing--validation-matrix"><code>docs/testing.md</code></a> for coverage details.</p>
+<p>See also <a href="#raftstore-deep-dive"><code>docs/raftstore.md</code></a> for deeper internals, <a href="#pd-lite"><code>docs/pd.md</code></a> for control-plane details, and <a href="#testing--validation-matrix"><code>docs/testing.md</code></a> for coverage details.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="configuration--options"><a class="header" href="#configuration--options">Configuration &amp; Options</a></h1>
 <p>NoKV exposes two configuration surfaces:</p>
@@ -755,10 +758,17 @@ are interpreted as nanoseconds.</li>
 <h2 id="2-raft-topology-file"><a class="header" href="#2-raft-topology-file">2. Raft Topology File</a></h2>
 <p><code>raft_config.example.json</code> is the single source of truth for distributed
 topology. It is consumed by scripts, <code>cmd/nokv-redis</code>, and the <code>config</code> package.</p>
+<p>Precedence rule: when a value can be provided by both CLI flags and config
+file, CLI flags take precedence; config acts as startup defaults.</p>
 <p>Minimal shape:</p>
 <pre><code class="language-jsonc">{
   "max_retries": 8,
-  "tso": { "listen_addr": "127.0.0.1:9494", "advertise_url": "http://127.0.0.1:9494" },
+  "pd": {
+    "addr": "127.0.0.1:2379",
+    "docker_addr": "nokv-pd:2379",
+    "work_dir": "./artifacts/cluster/pd",
+    "docker_work_dir": "/var/lib/nokv-pd"
+  },
   "stores": [
     { "store_id": 1, "listen_addr": "127.0.0.1:20170", "addr": "127.0.0.1:20170" }
   ],
@@ -779,7 +789,13 @@ topology. It is consumed by scripts, <code>cmd/nokv-redis</code>, and the <code>
 <li><code>start_key</code> / <code>end_key</code> accept plain strings, <code>hex:&lt;bytes&gt;</code>, or base64. Use
 <code>"-"</code> or empty for unbounded ranges.</li>
 <li><code>stores</code> define both host and docker addresses for local runs vs containers.</li>
-<li><code>leader_store_id</code> is optional; clients use it for initial routing hints.</li>
+<li><code>pd.addr</code> is the default PD endpoint for host scope; <code>pd.docker_addr</code> is used
+when tools run in docker scope.</li>
+<li><code>pd.work_dir</code> / <code>pd.docker_work_dir</code> are optional PD persistence directories
+used by bootstrap tooling and <code>nokv pd --config ...</code> when <code>--workdir</code> is not
+set explicitly.</li>
+<li><code>leader_store_id</code> is optional bootstrap metadata. Runtime routing in cluster
+mode is resolved through PD (<code>GetRegionByKey</code>), not static leader hints.</li>
 </ul>
 <p>Programmatic loading:</p>
 <pre><code class="language-go">cfg, _ := config.LoadFile("raft_config.example.json")
@@ -820,7 +836,6 @@ if err := cfg.Validate(); err != nil { /* handle */ }
 <li><code>value_log.segments</code>, <code>value_log.pending_deletes</code>, <code>value_log.gc.*</code></li>
 <li><code>wal.active_segment</code>, <code>wal.segment_count</code>, <code>wal.typed_record_ratio</code></li>
 <li><code>write.queue_depth</code>, <code>write.queue_entries</code>, <code>write.hot_key_limited</code></li>
-<li><code>txn.active</code>, <code>txn.committed</code>, <code>txn.conflicts</code></li>
 <li><code>region.total</code>, <code>region.running</code>, <code>region.removing</code></li>
 <li><code>hot.read_keys</code>, <code>hot.write_keys</code></li>
 <li><code>lsm.levels</code>, <code>lsm.value_bytes_total</code></li>
@@ -844,14 +859,10 @@ if err := cfg.Validate(); err != nil { /* handle */ }
 <li>Dumps manifest-backed region catalog (state/range/epoch/peers)</li>
 <li>Supports <code>--json</code></li>
 </ul>
-<h3 id="nokv-scheduler"><a class="header" href="#nokv-scheduler"><code>nokv scheduler</code></a></h3>
-<ul>
-<li>Displays scheduler heartbeat snapshot (in-process usage)</li>
-</ul>
 <h3 id="nokv-serve"><a class="header" href="#nokv-serve"><code>nokv serve</code></a></h3>
 <ul>
 <li>Starts TinyKv gRPC service backed by local <code>raftstore</code></li>
-<li>Requires <code>--workdir</code> and <code>--store-id</code></li>
+<li>Requires <code>--workdir</code>, <code>--store-id</code>, and <code>--pd-addr</code></li>
 <li>Common flags:
 <ul>
 <li><code>--addr</code> (default <code>127.0.0.1:20160</code>)</li>
@@ -867,6 +878,7 @@ if err := cfg.Validate(); err != nil { /* handle */ }
   --workdir ./artifacts/cluster/store-1 \
   --store-id 1 \
   --addr 127.0.0.1:20170 \
+  --pd-addr 127.0.0.1:2379 \
   --peer 2=127.0.0.1:20171 \
   --peer 3=127.0.0.1:20172
 </code></pre>
@@ -924,16 +936,17 @@ if err := cfg.Validate(); err != nil { /* handle */ }
 <ol>
 <li><strong>Active → Immutable</strong> – when <code>mt.walSize + estimate</code> exceeds <code>Options.MemTableSize</code>, the memtable is rotated and pushed onto the flush queue. The new active memtable triggers another WAL segment switch.</li>
 <li><strong>Flush</strong> – the flush manager drains immutable memtables, builds SSTables, logs manifest edits, and releases the WAL segment ID recorded in <code>memTable.segmentID</code> once the SST is durably installed.</li>
-<li><strong>Recovery</strong> – <code>LSM.recovery</code> scans WAL files, reopens memtables per segment (most recent becomes active), and deletes segments ≤ the manifest’s log pointer. Entries are replayed via <code>wal.Manager.ReplaySegment</code> into fresh indexes, rebuilding <code>maxVersion</code> for the oracle.</li>
+<li><strong>Recovery</strong> – <code>LSM.recovery</code> scans WAL files, reopens memtables per segment (most recent becomes active), and deletes segments ≤ the manifest’s log pointer. Entries are replayed via <code>wal.Manager.ReplaySegment</code> into fresh indexes and the active in-memory state is rebuilt.</li>
 </ol>
 <p>Badger follows the same pattern, while RocksDB often uses skiplist-backed arenas with reference counting—NoKV reuses Badger’s arena allocator for simplicity.</p>
 <hr>
 <h2 id="3-read-semantics"><a class="header" href="#3-read-semantics">3. Read Semantics</a></h2>
 <ul>
-<li><code>memTable.Get</code> looks up the chosen index and returns a borrowed, ref-counted <code>*kv.Entry</code> from the internal pool. Internal callers must release it with <code>DecrRef</code> when done. MVCC versions stay encoded in the key suffix (<code>KeyWithTs</code>), so iterators naturally merge across memtables and SSTables.</li>
+<li><code>memTable.Get</code> looks up the chosen index and returns a borrowed, ref-counted <code>*kv.Entry</code> from the internal pool. Internal callers must release it with <code>DecrRef</code> when done. MVCC versions stay encoded in internal keys (<code>InternalKey(CFDefault, userKey, ts)</code> for default-CF paths), so iterators naturally merge across memtables and SSTables.</li>
 <li><code>MemTable.IncrRef/DecrRef</code> delegate to the index, allowing iterators to hold references while the flush manager processes immutable tables—mirroring RocksDB’s <code>MemTable::Ref/Unref</code> lifecycle.</li>
 <li>WAL-backed values that exceed the value threshold are stored as pointers; the memtable stores the encoded pointer, and the transaction/iterator logic reads from the vlog on demand.</li>
-<li>Public read APIs (<code>DB.Get</code>, <code>DB.GetCF</code>, <code>DB.GetVersionedEntry</code>, <code>Txn.Get</code>) return detached entries. Callers must not call <code>DecrRef</code> on those entries.</li>
+<li><code>DB.Get</code> returns detached entries; callers must not call <code>DecrRef</code> on them.</li>
+<li><code>DB.GetInternalEntry</code> returns borrowed entries; callers must call <code>DecrRef</code> exactly once.</li>
 </ul>
 <hr>
 <h2 id="4-integration-with-other-subsystems"><a class="header" href="#4-integration-with-other-subsystems">4. Integration with Other Subsystems</a></h2>
@@ -943,7 +956,7 @@ if err := cfg.Validate(); err != nil { /* handle */ }
 <tr><th>Subsystem</th><th>Interaction</th></tr>
 </thead>
 <tbody>
-<tr><td>Transactions</td><td><code>Txn.commitAndSend</code> writes entries into the active memtable after WAL append; pending writes bypass the memtable until commit so per-txn isolation is preserved.</td></tr>
+<tr><td>Distributed 2PC</td><td><code>kv.Apply</code> + <code>percolator</code> write committed MVCC versions through the same WAL/memtable pipeline in raft mode.</td></tr>
 <tr><td>Manifest</td><td>Flush completion logs <code>EditLogPointer(segmentID)</code> so restart can discard WAL files already persisted into SSTs.</td></tr>
 <tr><td>Stats</td><td><code>Stats.Snapshot</code> pulls <code>FlushPending/Active/Queue</code> counters via <a href="../lsm/lsm.go#L120-L128"><code>lsm.FlushMetrics</code></a>, exposing how many immutables are waiting.</td></tr>
 <tr><td>Value Log</td><td><code>lsm.flush</code> emits discard stats keyed by <code>segmentID</code>, letting the value log GC know when entries become obsolete.</td></tr>
@@ -975,15 +988,15 @@ if err := cfg.Validate(); err != nil { /* handle */ }
 <p>See <a href="#memtable-flush-pipeline"><code>docs/flush.md</code></a> for the end-to-end flush scheduler and <code>[docs/architecture.md](architecture.md#3-end-to-end-write-flow)</code> for where memtables sit in the write pipeline.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="memtable-flush-pipeline"><a class="header" href="#memtable-flush-pipeline">MemTable Flush Pipeline</a></h1>
-<p>NoKV’s flush subsystem translates immutable memtables into persisted SSTables while coordinating WAL checkpoints and ValueLog discard statistics. The code lives in <a href="../lsm/flush"><code>lsm/flush</code></a> and is tightly integrated with <code>DB.doWrites</code> and <code>manifest.Manager</code>.</p>
+<p>NoKV’s flush path converts immutable memtables into L0 SST files, then advances the manifest WAL checkpoint and reclaims obsolete WAL segments. The task scheduler is in <a href="../lsm/flush"><code>lsm/flush</code></a>; SST persistence and manifest install are in <a href="../lsm/builder.go"><code>lsm/builder.go</code></a> and <a href="../lsm/levels.go"><code>lsm/levels.go</code></a>.</p>
 <hr>
 <h2 id="1-responsibilities"><a class="header" href="#1-responsibilities">1. Responsibilities</a></h2>
 <ol>
-<li><strong>Reliability</strong> – ensure immutables become SSTables atomically, and failures are recoverable.</li>
-<li><strong>Coordination</strong> – release WAL segments only after manifest commits, and feed discard stats to ValueLog GC.</li>
-<li><strong>Observability</strong> – expose queue depth, stage durations, and task counts through <code>Stats.collect</code> and the CLI.</li>
+<li><strong>Persistence</strong>: materialize immutable memtables into SST files.</li>
+<li><strong>Ordering</strong>: publish SST metadata to manifest only after the SST is durably installed (strict mode).</li>
+<li><strong>Cleanup</strong>: remove WAL segments once checkpoint and raft constraints allow removal.</li>
+<li><strong>Observability</strong>: export queue/build/release timing through flush metrics.</li>
 </ol>
-<p>Compared with RocksDB: the stage transitions mirror RocksDB’s flush job lifecycle (<code>PickMemTable</code>, <code>WriteLevel0Table</code>, <code>InstallMemTable</code>), while the discard stats channel is inspired by Badger’s integration with vlog GC.</p>
 <hr>
 <h2 id="2-stage-machine"><a class="header" href="#2-stage-machine">2. Stage Machine</a></h2>
 <pre class="mermaid">flowchart LR
@@ -999,71 +1012,76 @@ if err := cfg.Validate(); err != nil { /* handle */ }
 </pre>
 
 <ul>
-<li><strong>StagePrepare</strong> – <code>Manager.Submit</code> assigns a task ID, records enqueue time, and bumps queue metrics.</li>
-<li><strong>StageBuild</strong> – <code>Manager.Next</code> hands tasks to background workers. <code>buildTable</code> serialises data into a temporary <code>.sst.tmp</code> using <code>lsm/builder.go</code>.</li>
-<li><strong>StageInstall</strong> – manifest edits (<code>EditAddFile</code>, <code>EditLogPointer</code>) are logged. Only on success is the temp file renamed and the WAL checkpoint advanced.</li>
-<li><strong>StageRelease</strong> – metrics record release duration, discard stats are flushed to <code>valueLog.lfDiscardStats</code>, and <code>wal.Manager.Remove</code> drops obsolete segments.</li>
+<li><strong>StagePrepare</strong>: <code>flush.Manager.Submit</code> enqueues task and records wait-start time.</li>
+<li><strong>StageBuild</strong>: worker pulls task via <code>flush.Manager.Next</code>, builds SST (<code>levelManager.flush</code> -&gt; <code>openTable</code> -&gt; <code>tableBuilder.flush</code>).</li>
+<li><strong>StageInstall</strong>: after SST + manifest edits succeed, worker marks install complete (<code>flush.Manager.Update(..., StageInstall, ...)</code>).</li>
+<li><strong>StageRelease</strong>: worker removes immutable from in-memory list, closes memtable, records release metrics, and completes task.</li>
 </ul>
-<p><code>Manager.Update</code> transitions between stages and collects timing data (<code>WaitNs</code>, <code>BuildNs</code>, <code>ReleaseNs</code>). These surface via <code>StatsSnapshot.Flush</code> fields (for example <code>QueueLength</code>, <code>BuildMs</code>) in <code>nokv stats</code> output.</p>
 <hr>
-<h2 id="3-key-types"><a class="header" href="#3-key-types">3. Key Types</a></h2>
-<pre><code class="language-go">type Task struct {
-    ID        uint64
-    SegmentID uint32
-    Stage     Stage
-    Data      any      // memtable pointer, temp file info, etc.
-    Err       error
-}
-
-type Manager struct {
-    queue []*Task
-    active map[uint64]*Task
-    cond  *sync.Cond
-    // atomic metrics fields (pending, queueLen, waitNs...)
-}
-</code></pre>
+<h2 id="3-sst-persistence-modes"><a class="header" href="#3-sst-persistence-modes">3. SST Persistence Modes</a></h2>
+<p>Flush uses two write modes controlled by <code>Options.ManifestSync</code>:</p>
+<ol>
+<li>
+<p><strong>Fast path (<code>ManifestSync=false</code>)</strong></p>
 <ul>
-<li><code>Stage</code> enumerates <code>StagePrepare</code>, <code>StageBuild</code>, <code>StageInstall</code>, <code>StageRelease</code>.</li>
-<li><code>Metrics</code> aggregates pending/active counts and nanosecond accumulators; the CLI converts them to human-friendly durations.</li>
-<li>The queue uses condition variables to coordinate between background workers and producers; the design avoids busy waiting, unlike some RocksDB flush queues.</li>
+<li>Writes SST directly to final filename with <code>O_CREATE|O_EXCL</code>.</li>
+<li>No temp file/rename step.</li>
+<li>Highest throughput, weaker crash-consistency guarantees.</li>
 </ul>
+</li>
+<li>
+<p><strong>Strict path (<code>ManifestSync=true</code>)</strong></p>
+<ul>
+<li>Writes to <code>"&lt;table&gt;.tmp.&lt;pid&gt;.&lt;ns&gt;"</code>.</li>
+<li><code>tmp.Sync()</code> to persist SST bytes.</li>
+<li><code>RenameNoReplace(tmp, final)</code> installs file atomically (or fallback semantics on unsupported platforms).</li>
+<li><code>SyncDir(workdir)</code> is called before manifest edit so directory entry is durable.</li>
+</ul>
+</li>
+</ol>
+<p>This is the durability ordering used by current code.</p>
 <hr>
 <h2 id="4-execution-path-in-code"><a class="header" href="#4-execution-path-in-code">4. Execution Path in Code</a></h2>
 <ol>
-<li><code>DB.applyBatches</code> detects when the active memtable is full and hands it to <code>lsm.LSM.scheduleFlush</code>, which calls <code>flush.Manager.Submit</code>.</li>
-<li>Background goroutines call <code>Next</code> to retrieve tasks; <code>lsm.(*LSM).runFlushMemTable</code> performs the build and install phases.</li>
-<li><code>lsm.(*LSM).installLevel0Table</code> writes the manifest edit and renames the SST (atomic <code>os.Rename</code>, same as RocksDB’s flush job).</li>
-<li>After install, <code>valueLog.updateDiscardStats</code> is called so GC can reclaim vlog entries belonging to dropped keys.</li>
-<li>Once release completes, <code>wal.Manager.Remove</code> evicts segments whose entries are fully represented in SSTs, matching RocksDB’s <code>LogFileManager::PurgeObsoleteLogs</code>.</li>
+<li><code>lsm.Set</code>/<code>lsm.SetBatch</code> detects <code>walSize + estimate &gt; MemTableSize</code> and rotates memtable.</li>
+<li>Rotated memtable is submitted to <code>flush.Manager</code> (<code>lsm.submitFlush</code>).</li>
+<li>Worker executes <code>levelManager.flush(mt)</code>:
+<ul>
+<li>iterates memtable entries,</li>
+<li>builds SST via <code>tableBuilder</code>,</li>
+<li>prepares manifest edits: <code>EditAddFile</code> + <code>EditLogPointer</code>.</li>
+</ul>
+</li>
+<li>In strict mode, <code>SyncDir</code> runs before <code>manifest.LogEdits(...)</code>.</li>
+<li>On successful manifest commit, table is added to L0 and <code>wal.RemoveSegment</code> runs when allowed.</li>
 </ol>
 <hr>
-<h2 id="5-recovery-considerations"><a class="header" href="#5-recovery-considerations">5. Recovery Considerations</a></h2>
+<h2 id="5-recovery-notes"><a class="header" href="#5-recovery-notes">5. Recovery Notes</a></h2>
 <ul>
-<li><strong>Before Install</strong> – temp files remain in <code>tmp/</code>. On restart, no manifest entry exists, so <code>lsm.LSM.replayManifest</code> ignores them and the memtable is rebuilt from WAL.</li>
-<li><strong>After Install but before Release</strong> – manifest records the SST while WAL segments may still exist. Recovery sees the edit, ensures the file exists, and release metrics resume from StageRelease.</li>
-<li><strong>Metrics</strong> – because timing data is stored atomically in the manager, recovery resets counters but does not prevent the CLI from reporting backlog immediately after restart.</li>
+<li>Startup rebuild (<code>levelManager.build</code>) validates manifest SST entries against disk.</li>
+<li>Missing or unreadable SSTs are treated as stale and removed from manifest via <code>EditDeleteFile</code>, allowing startup to continue.</li>
+<li>Temp SST names are only used in strict mode and are created in <code>WorkDir</code> with suffix <code>.tmp.&lt;pid&gt;.&lt;ns&gt;</code> (not a dedicated <code>tmp/</code> directory).</li>
 </ul>
-<p>RocksDB uses flush job logs; NoKV reuses metrics and CLI output for similar visibility.</p>
 <hr>
-<h2 id="6-observability--cli"><a class="header" href="#6-observability--cli">6. Observability &amp; CLI</a></h2>
+<h2 id="6-metrics--cli"><a class="header" href="#6-metrics--cli">6. Metrics &amp; CLI</a></h2>
+<p><code>flush.Manager.Stats()</code> feeds <code>StatsSnapshot.Flush</code>:</p>
 <ul>
-<li><code>StatsSnapshot.Flush.QueueLength</code> – number of pending tasks.</li>
-<li><code>StatsSnapshot.Flush.WaitMs</code> – average wait time before build.</li>
-<li><code>StatsSnapshot.Flush.BuildMs</code> – average build duration.</li>
-<li><code>StatsSnapshot.Flush.Completed</code> – cumulative tasks finished.</li>
+<li><code>pending</code>, <code>queue</code>, <code>active</code></li>
+<li>wait/build/release totals, counts, last, max</li>
+<li><code>completed</code></li>
 </ul>
-<p>The CLI command <code>nokv stats --workdir &lt;dir&gt;</code> prints these metrics alongside compaction and transaction statistics, enabling operators to detect stalled flush workers or WAL backlog quickly.</p>
+<p>Use:</p>
+<pre><code class="language-bash">nokv stats --workdir &lt;dir&gt;
+</code></pre>
+<p>to inspect flush backlog and latency.</p>
 <hr>
-<h2 id="7-interplay-with-valuelog-gc"><a class="header" href="#7-interplay-with-valuelog-gc">7. Interplay with ValueLog GC</a></h2>
-<p>Flush completion sends discard stats via <code>db.lsm.SetDiscardStatsCh(&amp;(db.vlog.lfDiscardStats.flushChan))</code>. ValueLog GC uses this feed to determine how much of each vlog segment is obsolete, similar to Badger’s discard ratio heuristic. Without flush-driven stats, vlog GC would have to rescan SSTables, so this channel is crucial for keeping GC cheap.</p>
-<hr>
-<h2 id="8-testing-matrix"><a class="header" href="#8-testing-matrix">8. Testing Matrix</a></h2>
+<h2 id="7-related-tests"><a class="header" href="#7-related-tests">7. Related Tests</a></h2>
 <ul>
-<li><code>lsm/flush/manager_test.go</code> (implicit via <code>lsm/lsm_test.go</code>) validates stage transitions and metrics.</li>
-<li><code>db_test.go</code> covers crash scenarios before/after install, ensuring WAL replay plus manifest reconciliation recovers gracefully.</li>
-<li>Future additions: inject write failures during <code>StageBuild</code> to test retry logic, analogous to RocksDB’s simulated IO errors.</li>
+<li><code>lsm/flush/manager_test.go</code>: queue/stage transitions and timing counters.</li>
+<li><code>db_test.go::TestRecoveryWALReplayRestoresData</code>: replay still restores data after crash before flush completion.</li>
+<li><code>db_test.go::TestRecoveryCleansMissingSSTFromManifest</code> and <code>db_test.go::TestRecoveryCleansCorruptSSTFromManifest</code>: stale manifest SST cleanup on startup.</li>
 </ul>
-<p>See the <a href="#crash-recovery-playbook">recovery plan</a> and <a href="#testing--validation-matrix">testing matrix</a> for more context.</p>
+<p>See also <a href="#crash-recovery-playbook">recovery.md</a>, <a href="#memtable-design--lifecycle">memtable.md</a>, and <a href="#wal-subsystem">wal.md</a>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="compaction--cache-strategy"><a class="header" href="#compaction--cache-strategy">Compaction &amp; Cache Strategy</a></h1>
 <blockquote>
@@ -1232,7 +1250,7 @@ uint32 checksum (CRC32 Castagnoli over type + payload)
 <li>Checksums use <code>kv.CastagnoliCrcTable</code>, the same polynomial used by RocksDB (Castagnoli). Record encoding/decoding lives in <code>wal/record.go</code>.</li>
 <li>The type byte allows mixing LSM mutations with raft log/state/snapshot records in the same WAL segment.</li>
 <li>Appends are buffered by <code>bufio.Writer</code> so batches become single system calls.</li>
-<li>Replay stops cleanly at truncated tails; tests simulate torn writes by truncating the final bytes and verifying replay remains idempotent (<code>wal/manager_test.go::TestReplayTruncatedTail</code>).</li>
+<li>Replay stops cleanly at truncated tails; tests simulate torn writes by truncating the final bytes and verifying replay remains idempotent (<code>wal/manager_test.go::TestManagerReplayHandlesTruncate</code>).</li>
 </ul>
 <hr>
 <h2 id="3-public-api-go"><a class="header" href="#3-public-api-go">3. Public API (Go)</a></h2>
@@ -1265,8 +1283,8 @@ _ = mgr.Replay(func(info wal.EntryInfo, payload []byte) error {
 <tr><td><code>lsm.memTable.set</code></td><td>Encodes each entry (<code>kv.EncodeEntry</code>) and appends to WAL before inserting into the skiplist.</td></tr>
 <tr><td><code>DB.commitWorker</code></td><td>Commit worker applies batched writes via <code>writeToLSM</code>, which flows into <code>lsm.Set</code> and thus WAL.</td></tr>
 <tr><td><code>DB.Set</code></td><td>Direct write path: calls <code>lsm.Set</code>, which appends to WAL and updates the memtable.</td></tr>
-<tr><td><code>manifest.Manager.LogEdit</code></td><td>Uses <code>EntryInfo.SegmentID</code> to persist the WAL checkpoint (<code>EditLogPointer</code>). This acts as the <code>log number</code> seen in RocksDB manifest entries.</td></tr>
-<tr><td><code>lsm/flush.Manager.Update</code></td><td>Once an SST is installed, WAL segments older than the checkpoint are released (<code>wal.Manager.Remove</code>).</td></tr>
+<tr><td><code>lsm/levels.go::flush</code></td><td>Persists WAL checkpoint via <code>manifest.LogEdits(EditAddFile, EditLogPointer)</code> during flush install.</td></tr>
+<tr><td><code>lsm/levels.go::flush</code> + <code>lsm/levelManager.canRemoveWalSegment</code></td><td>Removes obsolete WAL segments after checkpoint/raft constraints are satisfied.</td></tr>
 <tr><td><code>db.runRecoveryChecks</code></td><td>Ensures WAL directory invariants before manifest replay, similar to Badger’s directory bootstrap.</td></tr>
 </tbody>
 </table>
@@ -1415,7 +1433,7 @@ _ = mgr.Remove(fid)  // close + delete file
 <li><a href="../vlog.go"><code>valueLog.write</code></a> builds a write mask for each batch, then delegates to <a href="../vlog/io.go"><code>Manager.AppendEntries</code></a>. Entries staying in LSM (<code>shouldWriteValueToLSM</code>) receive zero-value pointers.</li>
 <li>Rotation is handled inside the manager when the reserved bytes would exceed <code>MaxSize</code>. The WAL append happens <strong>after</strong> the value log append so crash replay observes consistent pointers.</li>
 <li>Any error triggers <code>Manager.Rewind</code> back to the saved head pointer, removing new files and truncating partial bytes. <a href="../vlog_test.go"><code>vlog_test.go</code></a> exercises both append- and rotate-failure paths.</li>
-<li><code>Txn.Commit</code> and batched writes share the same pipeline: the commit worker always writes the value log first, then applies to WAL/memtable, keeping MVCC and durability ordering consistent.</li>
+<li>All batched writes share the same pipeline: the commit worker always writes the value log first, then applies to WAL/memtable, keeping ordering and durability consistent.</li>
 </ol>
 <p>Badger follows the same ordering (value log first, then write batch). RocksDB’s blob DB instead embeds blob references into the WAL entry before the blob file write, relying on two-phase commit between WAL and blob; NoKV avoids the extra coordination by reusing a single batching loop.</p>
 <hr>
@@ -1498,83 +1516,71 @@ _ = mgr.Remove(fid)  // close + delete file
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="manifest--version-management"><a class="header" href="#manifest--version-management">Manifest &amp; Version Management</a></h1>
-<p>The manifest keeps the source of truth for SST files, WAL checkpoints, and ValueLog heads. NoKV’s implementation (<code>manifest/manager.go</code>, <code>manifest/codec.go</code>, <code>manifest/types.go</code>) borrows RocksDB’s <code>VersionEdit + CURRENT</code> pattern while adding metadata required for value separation.</p>
+<p>The manifest is NoKV’s metadata log for:</p>
+<ul>
+<li>SST files (<code>EditAddFile</code> / <code>EditDeleteFile</code>)</li>
+<li>WAL checkpoint (<code>EditLogPointer</code>)</li>
+<li>value-log metadata (<code>EditValueLogHead</code>, <code>EditDeleteValueLog</code>, <code>EditUpdateValueLog</code>)</li>
+<li>raft and region metadata (<code>EditRaftPointer</code>, <code>EditRegion</code>)</li>
+</ul>
+<p>Implementation: <a href="../manifest/manager.go"><code>manifest/manager.go</code></a>, <a href="../manifest/codec.go"><code>manifest/codec.go</code></a>, <a href="../manifest/types.go"><code>manifest/types.go</code></a>.</p>
 <hr>
-<h2 id="1-file-layout"><a class="header" href="#1-file-layout">1. File Layout</a></h2>
+<h2 id="1-files-on-disk"><a class="header" href="#1-files-on-disk">1. Files on Disk</a></h2>
 <pre><code class="language-text">WorkDir/
-  CURRENT             # stores the active MANIFEST file name
-  MANIFEST-000001     # log of manifest edits
-  MANIFEST-000002     # newer file after rewrite
+  CURRENT
+  MANIFEST-000001
+  MANIFEST-000002
 </code></pre>
 <ul>
-<li><code>CURRENT</code> is atomically swapped via <code>CURRENT.tmp</code> → <code>CURRENT</code> rename.</li>
-<li>Each <code>MANIFEST-*</code> contains a series of binary edits prefixed by the magic string <code>"NoKV"</code> (encoding lives in <code>manifest/codec.go</code>).</li>
-<li>During <code>manifest.Open</code>, <code>loadCurrent</code> opens the file referenced by CURRENT; if missing, <code>createNew</code> bootstraps an empty manifest.</li>
+<li><code>CURRENT</code> stores the active manifest filename.</li>
+<li><code>CURRENT</code> is updated via <code>CURRENT.tmp -&gt; CURRENT</code> rename.</li>
+<li><code>MANIFEST-*</code> stores append-only encoded edits.</li>
 </ul>
 <hr>
-<h2 id="2-edit-types"><a class="header" href="#2-edit-types">2. Edit Types</a></h2>
-<pre><code class="language-go">type EditType uint8
-const (
-    EditAddFile EditType = iota
-    EditDeleteFile
-    EditLogPointer
-    EditValueLogHead
-    EditDeleteValueLog
-    EditUpdateValueLog
-    EditRaftPointer
-    EditRegion
-)
-</code></pre>
-<p>Each edit serialises one logical action:</p>
-<ul>
-<li><code>EditAddFile</code> / <code>EditDeleteFile</code> – manage SST metadata (<code>FileMeta</code>: level, fileID, size, key bounds, timestamps).</li>
-<li><code>EditLogPointer</code> – persists the latest WAL segment + offset checkpoint, analogous to RocksDB’s <code>log_number</code> and <code>prev_log_number</code> fields.</li>
-<li><code>EditValueLogHead</code> – records the head pointer for vlog append, ensuring recovery resumes from the correct file/offset.</li>
-<li><code>EditDeleteValueLog</code> – marks a vlog segment logically deleted (GC has reclaimed it).</li>
-<li><code>EditUpdateValueLog</code> – updates metadata for an existing vlog file (used when GC rewrites a segment).</li>
-<li><code>EditRaftPointer</code> – persists raft-group WAL progress (segment, offset, applied/truncated index &amp; term, etc.).</li>
-<li><code>EditRegion</code> – persists Region metadata (key range, epoch, peers, lifecycle state).</li>
-</ul>
-<p><code>manifest.Manager.apply</code> interprets each edit and updates the in-memory <code>Version</code> structure, which is consumed by LSM initialisation and value log recovery.</p>
-<hr>
-<h2 id="3-version-structure"><a class="header" href="#3-version-structure">3. Version Structure</a></h2>
+<h2 id="2-in-memory-version-model"><a class="header" href="#2-in-memory-version-model">2. In-Memory Version Model</a></h2>
 <pre><code class="language-go">type Version struct {
     Levels       map[int][]FileMeta
     LogSegment   uint32
     LogOffset    uint64
-    ValueLogs    map[uint32]ValueLogMeta
-    ValueLogHead ValueLogMeta
+    ValueLogs    map[ValueLogID]ValueLogMeta
+    ValueLogHead map[uint32]ValueLogMeta
     RaftPointers map[uint64]RaftLogPointer
     Regions      map[uint64]RegionMeta
 }
 </code></pre>
 <ul>
-<li><code>Levels</code> mirrors the LSM tree levels; during recovery <code>lsm.LSM</code> loads files per level.</li>
-<li><code>LogSegment</code>/<code>LogOffset</code> ensure WAL replay starts exactly where persistent state ended.</li>
-<li><code>ValueLogs</code> holds metadata for every known vlog file; <code>ValueLogHead</code> caches the active head for quick access.</li>
+<li><code>Levels</code>: per-level SST metadata.</li>
+<li><code>LogSegment/LogOffset</code>: WAL replay checkpoint.</li>
+<li><code>ValueLogs</code> + <code>ValueLogHead</code>: all known vlog segments and per-bucket active heads.</li>
+<li><code>RaftPointers/Regions</code>: raftstore progress + region metadata.</li>
 </ul>
-<p>Compared with RocksDB: RocksDB’s manifest stores blob file metadata when <code>BlobDB</code> is enabled. NoKV integrates vlog metadata natively to avoid a separate blob manifest.</p>
 <hr>
-<h2 id="4-lifecycle"><a class="header" href="#4-lifecycle">4. Lifecycle</a></h2>
-<pre class="mermaid">sequenceDiagram
-    participant DB
-    participant Manifest
-    participant CURRENT
-    DB-&gt;&gt;Manifest: Open(dir)
-    Manifest-&gt;&gt;CURRENT: read file name
-    Manifest-&gt;&gt;Manifest: replay edits → Version
-    DB-&gt;&gt;Manifest: LogEdit(EditAddFile+LogPointer)
-    Manifest-&gt;&gt;Manifest: append edit
-    Manifest--&gt;&gt;DB: updated Version
-    Note over Manifest,CURRENT: On rewrite -&gt; write tmp -&gt; rename CURRENT
-</pre>
-
+<h2 id="3-edit-append-semantics"><a class="header" href="#3-edit-append-semantics">3. Edit Append Semantics</a></h2>
+<p><code>Manager.LogEdits(edits...)</code> does:</p>
+<ol>
+<li>Encode edits to a buffer.</li>
+<li>Write encoded bytes to current manifest file.</li>
+<li>Conditionally call <code>manifest.Sync()</code> when:
 <ul>
-<li><strong>Open/Rebuild</strong> – <code>replay</code> reads all edits, applying them sequentially (<code>bufio.Reader</code> ensures streaming). If any edit fails to decode, recovery aborts so operators can inspect the manifest, similar to RocksDB’s strictness.</li>
-<li><strong>LogEdit</strong> – obtains the mutex, appends the encoded edit, flushes, and updates the in-memory <code>Version</code> before returning.</li>
-<li><strong>Rewrite</strong> – when the manifest grows beyond <code>Options.ManifestRewriteThreshold</code>, the manager writes a new <code>MANIFEST-xxxxxx</code> containing a full snapshot of the current <code>Version</code>, fsyncs it, updates <code>CURRENT</code>, and removes the old file. This mirrors RocksDB’s <code>max_manifest_file_size</code> behavior while keeping recovery simple.</li>
-<li><strong>Close</strong> – flushes and closes the underlying file handle; the version stays available for introspection via <code>Manager.Version()</code> (used by CLI).</li>
+<li><code>Manager.syncWrites == true</code>, and</li>
+<li>at least one edit type requires sync (<code>Add/DeleteFile</code>, <code>LogPointer</code>, value-log edits).</li>
 </ul>
+</li>
+<li>Apply edits to in-memory <code>Version</code>.</li>
+<li>Trigger manifest rewrite if size crosses threshold.</li>
+</ol>
+<p><code>SetSync(bool)</code> and <code>SetRewriteThreshold(int64)</code> are configured by LSM options.</p>
+<hr>
+<h2 id="4-rewrite-flow"><a class="header" href="#4-rewrite-flow">4. Rewrite Flow</a></h2>
+<p>When rewrite threshold is exceeded (or <code>Rewrite()</code> is called):</p>
+<ol>
+<li>Create next <code>MANIFEST-xxxxxx</code>.</li>
+<li>Write a full snapshot of current <code>Version</code>.</li>
+<li>Flush writer, and <code>Sync()</code> the new manifest when <code>syncWrites</code> is enabled.</li>
+<li>Update <code>CURRENT</code> to point to new file.</li>
+<li>Reopen the new manifest for appends and remove old manifest file.</li>
+</ol>
+<p>If rewrite fails before <code>CURRENT</code> update, restart continues using previous manifest.</p>
 <hr>
 <h2 id="5-interaction-with-other-modules"><a class="header" href="#5-interaction-with-other-modules">5. Interaction with Other Modules</a></h2>
 <div class="table-wrapper">
@@ -1583,142 +1589,96 @@ const (
 <tr><th>Module</th><th>Manifest usage</th></tr>
 </thead>
 <tbody>
-<tr><td><code>lsm</code></td><td><code>installLevel0Table</code> logs <code>EditAddFile</code> + <code>EditLogPointer</code> to checkpoint WAL progress. Compaction deletes old files via <code>EditDeleteFile</code>.</td></tr>
-<tr><td><code>wal</code></td><td>Manifest’s log pointer tells WAL replay where to resume.</td></tr>
-<tr><td><code>vlog</code></td><td><code>valueLog.rewrite</code> writes <code>EditUpdateValueLog</code> / <code>EditDeleteValueLog</code> after GC, ensuring stale segments are not reopened.</td></tr>
-<tr><td><code>CLI</code></td><td><code>nokv manifest</code> reads <code>manifest.Manager.Version()</code> and prints levels, vlog head, and deletion status.</td></tr>
+<tr><td><code>lsm/levels.go::flush</code></td><td>Logs <code>EditAddFile</code> + <code>EditLogPointer</code> after SST install; compaction logs add/delete edits.</td></tr>
+<tr><td><code>lsm/levels.go::build</code></td><td>During startup, missing/corrupt SST entries are marked stale and cleaned via <code>EditDeleteFile</code>.</td></tr>
+<tr><td><code>wal</code></td><td>Replays from manifest checkpoint (<code>LogSegment</code>, <code>LogOffset</code>).</td></tr>
+<tr><td><code>vlog</code></td><td>Persists head/update/delete metadata and uses manifest state for stale/orphan cleanup on startup.</td></tr>
+<tr><td><code>raftstore</code></td><td>Persists raft pointers and region metadata through manifest edits.</td></tr>
 </tbody>
 </table>
 </div>
-<p>Badger keeps a separate <code>value.log</code> directory without manifest-level bookkeeping; NoKV’s integrated manifest avoids scanning the filesystem during recovery.</p>
 <hr>
-<h2 id="6-recovery-scenarios"><a class="header" href="#6-recovery-scenarios">6. Recovery Scenarios</a></h2>
+<h2 id="6-recovery-relevant-guarantees"><a class="header" href="#6-recovery-relevant-guarantees">6. Recovery-Relevant Guarantees</a></h2>
 <ol>
-<li><strong>Missing SST file</strong> – if <code>MANIFEST</code> references <code>000123.sst</code> but the file is absent, <code>db_test.go::TestRecoveryCleansMissingSSTFromManifest</code> verifies that recovery removes the edit, mimicking RocksDB’s lost table handling.</li>
-<li><strong>ValueLog deletion</strong> – <code>TestRecoveryRemovesStaleValueLogSegment</code> ensures <code>EditDeleteValueLog</code> entries trigger file removal during recovery.</li>
-<li><strong>Manifest rewrite crash</strong> – <code>TestRecoveryManifestRewriteCrash</code> simulates a crash after writing the new manifest but before updating <code>CURRENT</code>; recovery still points to the old manifest and resumes safely, exactly like RocksDB’s two-phase rewrite.</li>
-<li><strong>Stale WAL pointer</strong> – WAL replay respects <code>LogSegment/Offset</code>; tests cover truncated WALs to confirm idempotency.</li>
+<li>Manifest append is ordered by single manager mutex.</li>
+<li>WAL replay starts from manifest checkpoint.</li>
+<li>Stale manifest SST entries are self-healed on startup (delete edit appended).</li>
+<li><code>CURRENT</code> indirection protects against partial manifest rewrite publication.</li>
 </ol>
 <hr>
-<h2 id="7-cli-output"><a class="header" href="#7-cli-output">7. CLI Output</a></h2>
-<p><code>nokv manifest --workdir &lt;dir&gt; --json</code> prints:</p>
+<h2 id="7-operational-commands"><a class="header" href="#7-operational-commands">7. Operational Commands</a></h2>
+<pre><code class="language-bash">nokv manifest --workdir &lt;dir&gt;
+</code></pre>
+<p>Useful fields:</p>
 <ul>
-<li><code>log_pointer.segment</code> / <code>log_pointer.offset</code> checkpoint.</li>
-<li>Per-level file counts, IDs, and byte totals (<code>levels[*]</code>).</li>
-<li><code>value_log_heads</code> metadata (bucketed heads).</li>
-<li><code>value_logs</code> list with <code>valid</code> status (mirroring RocksDB’s blob file dump).</li>
+<li><code>log_pointer.segment</code>, <code>log_pointer.offset</code></li>
+<li><code>levels[*].files</code></li>
+<li><code>value_log_heads</code></li>
+<li><code>value_logs[*].valid</code></li>
 </ul>
-<p>This structured output enables automated validation in CI and ad-hoc audits.</p>
-<hr>
-<h2 id="8-extensibility"><a class="header" href="#8-extensibility">8. Extensibility</a></h2>
-<ul>
-<li><strong>Column families</strong> – add a column family identifier to <code>FileMeta</code> and extend edits accordingly, as RocksDB does.</li>
-<li><strong>Snapshots</strong> – persistent snapshots can be derived from manifest versions (keep a copy of the current Version and WAL pointer).</li>
-<li><strong>Remote manifests</strong> – similar to RocksDB’s remote compaction, storing manifests in object storage is straightforward because edits are append-only.</li>
-</ul>
-<p>For end-to-end recovery context, see <a href="#crash-recovery-playbook">recovery.md</a> and the <a href="#nokv-architecture-overview">architecture overview</a>.</p>
+<p>See <a href="#crash-recovery-playbook">recovery.md</a> and <a href="#memtable-flush-pipeline">flush.md</a> for startup and flush ordering details.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="vfs"><a class="header" href="#vfs">VFS</a></h1>
-<p>The <code>vfs</code> package defines a unified filesystem abstraction used by NoKV storage paths (<code>wal</code>, <code>manifest</code>, <code>vlog</code>, <code>file</code>, and parts of <code>raftstore</code>).</p>
-<p>It is intentionally small and focused:</p>
-<ul>
-<li>Keep production code independent from direct <code>os.*</code> calls.</li>
-<li>Make fault-path testing deterministic.</li>
-<li>Keep the same call shape in embedded and distributed modes.</li>
-</ul>
+<p>The <code>vfs</code> package provides a small filesystem abstraction used by WAL, manifest, SST, value-log, and raftstore paths.</p>
 <hr>
-<h2 id="1-design-goals"><a class="header" href="#1-design-goals">1. Design Goals</a></h2>
-<ol>
-<li>One filesystem API for all persistence-critical modules.</li>
-<li>Explicit file-handle operations (<code>OpenHandle</code> / <code>OpenFileHandle</code>) so injected failures can target both path-level and handle-level behavior.</li>
-<li>Test-first error injection without adding module-local test hooks.</li>
-</ol>
-<hr>
-<h2 id="2-core-interfaces"><a class="header" href="#2-core-interfaces">2. Core Interfaces</a></h2>
-<p><code>vfs.FS</code> (namespace-level operations):</p>
+<h2 id="1-core-interfaces"><a class="header" href="#1-core-interfaces">1. Core Interfaces</a></h2>
+<p><code>vfs.FS</code> includes:</p>
 <ul>
-<li>open/create (<code>OpenHandle</code>, <code>OpenFileHandle</code>)</li>
-<li>path ops (<code>MkdirAll</code>, <code>Remove</code>, <code>RemoveAll</code>, <code>Rename</code>, <code>Stat</code>, <code>ReadDir</code>, <code>Glob</code>)</li>
-<li>whole-file helpers (<code>ReadFile</code>, <code>WriteFile</code>, <code>Truncate</code>)</li>
+<li>file open/create: <code>OpenHandle</code>, <code>OpenFileHandle</code></li>
+<li>path ops: <code>MkdirAll</code>, <code>Remove</code>, <code>RemoveAll</code>, <code>Rename</code>, <code>RenameNoReplace</code>, <code>Stat</code>, <code>ReadDir</code>, <code>Glob</code></li>
+<li>helpers: <code>ReadFile</code>, <code>WriteFile</code>, <code>Truncate</code>, <code>Hostname</code></li>
 </ul>
-<p><code>vfs.File</code> (handle-level operations):</p>
+<p><code>vfs.File</code> includes:</p>
 <ul>
-<li><code>Read</code> / <code>ReadAt</code></li>
-<li><code>Write</code> / <code>WriteAt</code></li>
-<li><code>Seek</code></li>
-<li><code>Sync</code></li>
-<li><code>Truncate</code></li>
-<li><code>Close</code></li>
-<li><code>Stat</code></li>
-<li><code>Name</code></li>
+<li>read/write/seek APIs</li>
+<li><code>Sync</code>, <code>Truncate</code>, <code>Close</code>, <code>Stat</code>, <code>Name</code></li>
 </ul>
-<p><code>Fd</code> is intentionally optional via <code>vfs.FDProvider</code>/<code>vfs.FileFD(...)</code> so non-OS
-file implementations can still satisfy <code>vfs.File</code>.</p>
-<p><code>vfs.OSFS</code> is the production implementation backed by the Go <code>os</code> package.<br><code>vfs.Ensure(fs)</code> normalizes <code>nil</code> to <code>OSFS</code>, so call sites can safely accept an optional <code>vfs.FS</code>.
-<code>vfs.SyncDir(fs, dir)</code> centralizes directory fsync semantics for create/rename/remove durability.</p>
+<p><code>vfs.Ensure(fs)</code> maps nil to <code>OSFS</code>.</p>
 <hr>
-<h2 id="3-fault-injection-model"><a class="header" href="#3-fault-injection-model">3. Fault Injection Model</a></h2>
-<p>NoKV provides <code>FaultFS</code> with rule-based injection:</p>
+<h2 id="2-rename-semantics"><a class="header" href="#2-rename-semantics">2. Rename Semantics</a></h2>
+<p><code>Rename</code>:</p>
 <ul>
-<li><code>FailOnceRule</code></li>
-<li><code>FailOnNthRule</code></li>
-<li><code>FailAfterNthRule</code></li>
+<li>normal rename/move semantics.</li>
+<li>target replacement behavior is platform-dependent (<code>os.Rename</code> behavior).</li>
 </ul>
-<p>Rules can match by operation + path, and for rename by src/dst path.</p>
-<h3 id="31-file-handle-level-injection-faultfile"><a class="header" href="#31-file-handle-level-injection-faultfile">3.1 File-Handle-Level Injection (<code>FaultFile</code>)</a></h3>
-<p>When <code>OpenHandle</code>/<code>OpenFileHandle</code> succeeds, the returned handle is wrapped as <code>faultFile</code>.
-<code>faultFile</code> supports deterministic failures on:</p>
+<p><code>RenameNoReplace</code>:</p>
 <ul>
-<li><code>Write</code> / <code>WriteAt</code> (<code>OpFileWrite</code>)</li>
-<li><code>Sync</code> (<code>OpFileSync</code>)</li>
-<li><code>Close</code> (<code>OpFileClose</code>)</li>
-<li><code>Truncate</code> (<code>OpFileTrunc</code>)</li>
+<li>contract: fail with <code>os.ErrExist</code> when destination already exists.</li>
+<li>on Linux, uses <code>renameat2(..., RENAME_NOREPLACE)</code> when supported.</li>
+<li>fallback path (<code>renameNoReplaceFallback</code>) checks destination existence then calls <code>Rename</code>.</li>
 </ul>
-<p>This is used to validate rollback and retry behavior for close/sync/truncate paths in WAL/Manifest verification and shutdown flows.</p>
+<p>Important: fallback is <strong>not atomic</strong> and has TOCTOU risk. Callers needing strict no-overwrite atomicity should avoid relying on fallback behavior.</p>
 <hr>
-<h2 id="4-where-it-is-used"><a class="header" href="#4-where-it-is-used">4. Where It Is Used</a></h2>
+<h2 id="3-directory-sync-helper"><a class="header" href="#3-directory-sync-helper">3. Directory Sync Helper</a></h2>
+<p><code>vfs.SyncDir(fs, dir)</code> fsyncs directory metadata to persist entry updates (create/rename/remove).</p>
+<p>This is used in strict durability paths (for example SST install before manifest publication) to guarantee directory entry persistence.</p>
+<hr>
+<h2 id="4-fault-injection-faultfs"><a class="header" href="#4-fault-injection-faultfs">4. Fault Injection (<code>FaultFS</code>)</a></h2>
+<p><code>FaultFS</code> wraps an underlying <code>FS</code> and can inject failures by operation/path.</p>
 <ul>
-<li><code>wal</code>: segment switch, close, verify/truncate.</li>
-<li><code>manifest</code>: edit logging, rewrite, verify, close.</li>
-<li><code>vlog</code>: verify/truncate and file open path.</li>
-<li><code>file</code>: mmap open/sync directory path via <code>vfs</code>.</li>
-<li><code>utils</code>: dir lock and utility wrappers.</li>
-<li><code>raftstore/engine</code>: disk storage and snapshot import/export.</li>
+<li>Rule helpers: <code>FailOnceRule</code>, <code>FailOnNthRule</code>, <code>FailAfterNthRule</code>, <code>FailOnceRenameRule</code></li>
+<li>File-handle faults: write/sync/close/truncate</li>
+<li>Rename fault matching supports <code>src</code>/<code>dst</code> targeting</li>
 </ul>
+<p>Used to test manifest/WAL/recovery failure paths deterministically.</p>
 <hr>
-<h2 id="5-comparison-with-pebble-vfs"><a class="header" href="#5-comparison-with-pebble-vfs">5. Comparison with Pebble VFS</a></h2>
-<p>NoKV’s design is inspired by Pebble’s VFS layering and error-injection philosophy, while intentionally keeping a smaller surface area.</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Aspect</th><th>Pebble VFS</th><th>NoKV VFS</th></tr>
-</thead>
-<tbody>
-<tr><td>API scope</td><td>Broad FS API (create/open/open-dir/link/reuse/lock/list/path helpers/disk usage)</td><td>Minimal API required by NoKV storage paths</td></tr>
-<tr><td>Wrapping model</td><td>Rich wrappers (<code>WithDiskHealthChecks</code>, <code>OnDiskFull</code>, logging wrappers)</td><td><code>FaultFS</code> focused on deterministic fault tests</td></tr>
-<tr><td>In-memory FS</td><td>Built-in <code>MemFS</code> / <code>StrictMem</code> for advanced test semantics</td><td>Not yet built-in (currently wraps real FS with injected errors)</td></tr>
-<tr><td>Error injection</td><td>Dedicated <code>errorfs</code> package and injector model</td><td>Built-in policy/rule model in <code>FaultFS</code></td></tr>
-<tr><td>Handle-level faulting</td><td>Supports wrapped file behavior through wrappers</td><td><code>FaultFile</code> with count-based fail on <code>Write/Sync/Close/Truncate</code></td></tr>
-</tbody>
-</table>
-</div>
-<p>Practical interpretation:</p>
+<h2 id="5-current-implementation-set"><a class="header" href="#5-current-implementation-set">5. Current Implementation Set</a></h2>
 <ul>
-<li>Pebble is a general-purpose storage-engine VFS toolkit.</li>
-<li>NoKV currently implements the subset needed for its engine and recovery semantics, with strong testability on critical failure paths.</li>
+<li><code>OSFS</code>: production implementation (Go <code>os</code> package).</li>
+<li><code>FaultFS</code>: failure-injection wrapper over any <code>FS</code>.</li>
 </ul>
+<p>No in-memory FS is included yet.</p>
 <hr>
-<h2 id="6-current-gaps-and-next-steps"><a class="header" href="#6-current-gaps-and-next-steps">6. Current Gaps and Next Steps</a></h2>
-<ol>
-<li>Add an in-memory <code>FS</code> implementation for fully isolated IO tests.</li>
-<li>Add optional disk-health and slow-IO instrumentation wrappers.</li>
-<li>Consider adding higher-level primitives where needed (<code>Lock</code>, <code>OpenDir</code>, hard-link/reuse helpers), but only when justified by real call sites.</li>
-</ol>
-<hr>
-<h2 id="7-references"><a class="header" href="#7-references">7. References</a></h2>
+<h2 id="6-design-notes"><a class="header" href="#6-design-notes">6. Design Notes</a></h2>
 <ul>
-<li>Pebble <code>vfs</code>: <a href="https://pkg.go.dev/github.com/cockroachdb/pebble/vfs">https://pkg.go.dev/github.com/cockroachdb/pebble/vfs</a></li>
-<li>Pebble <code>errorfs</code>: <a href="https://pkg.go.dev/github.com/cockroachdb/pebble/vfs/errorfs">https://pkg.go.dev/github.com/cockroachdb/pebble/vfs/errorfs</a></li>
+<li>Keep storage code decoupled from direct <code>os.*</code> calls.</li>
+<li>Make crash/failure tests reproducible.</li>
+<li>Keep API minimal and only add operations required by real storage call sites.</li>
+</ul>
+<p>References:</p>
+<ul>
+<li>Pebble VFS: <a href="https://pkg.go.dev/github.com/cockroachdb/pebble/vfs">https://pkg.go.dev/github.com/cockroachdb/pebble/vfs</a></li>
+<li>Pebble errorfs: <a href="https://pkg.go.dev/github.com/cockroachdb/pebble/vfs/errorfs">https://pkg.go.dev/github.com/cockroachdb/pebble/vfs/errorfs</a></li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="file-abstractions"><a class="header" href="#file-abstractions">File Abstractions</a></h1>
@@ -1792,7 +1752,7 @@ _ = lf.DoneWriting(nextOffset)
 <li><code>DoneWriting</code> provides strong crash-consistency guarantees. Even on filesystems where <code>ftruncate</code> metadata persistence is asynchronous, the explicit post-truncate <code>fsync</code> ensures the file size is durable upon success.</li>
 <li>Value-log and WAL segments rely on <code>DoneWriting</code>/<code>Truncate</code> to seal files; avoid manipulating files externally or mmap metadata may desynchronise.</li>
 <li><code>LogFile.AddSize</code> updates the cached size used by reads—critical when rewinding or rewriting segments.</li>
-<li><code>vfs.SyncDir</code> is invoked when new files are created to persist directory entries, similar to RocksDB’s <code>Env::FsyncDir</code>.</li>
+<li><code>vfs.SyncDir</code> is used by strict durability flows to persist directory entry changes (create/rename/remove). For example, strict SST flush calls <code>SyncDir(workdir)</code> before manifest publication.</li>
 </ul>
 <p>For more on how these primitives plug into higher layers, see <a href="#wal-subsystem"><code>docs/wal.md</code></a> and <a href="#value-log-vlog-design"><code>docs/vlog.md</code></a>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
@@ -1945,7 +1905,7 @@ Deeper levels rely on OS page cache + mmap readahead
 <hr>
 <h2 id="4-integration-points-1"><a class="header" href="#4-integration-points-1">4. Integration Points</a></h2>
 <ul>
-<li><strong>DB reads</strong> – <code>Txn.Get</code> and iterators call <code>db.recordRead</code>, which invokes <code>HotRing.Touch</code> on a <strong>read-only ring</strong> for every successful lookup.</li>
+<li><strong>DB reads</strong> – <code>DB.Get*</code> and iterators call <code>db.recordRead</code>, which invokes <code>HotRing.Touch</code> on a <strong>read-only ring</strong> for every successful lookup.</li>
 <li><strong>Write throttling &amp; hot batching</strong> – writes are tracked by a <strong>write-only ring</strong>. When <code>Options.WriteHotKeyLimit &gt; 0</code>, writes use <code>TouchAndClamp</code> to enforce throttling; when throttling is disabled but <code>HotWriteBurstThreshold &gt; 0</code>, writes still <code>Touch</code> so hot batching can trigger.</li>
 <li><strong>Stats</strong> – <code>StatsSnapshot.Hot.ReadKeys</code> and <code>StatsSnapshot.Hot.WriteKeys</code> publish read/write hot keys. <code>expvar</code> exposes these under <code>NoKV.Stats.hot.read_keys</code> and <code>NoKV.Stats.hot.write_keys</code>.</li>
 <li><strong>Caching</strong> – hot reads trigger asynchronous prefetch into the normal L0/L1 block cache path.</li>
@@ -2020,7 +1980,7 @@ settings. When override is enabled, <strong>zeros disable features</strong> (exc
 which falls back to the ring default).</p>
 <hr>
 <h2 id="7-write-path-throttling"><a class="header" href="#7-write-path-throttling">7. Write-Path Throttling</a></h2>
-<p><code>Options.WriteHotKeyLimit</code> wires the write-only HotRing into the write path. When set to a positive integer, every call to <code>DB.Set*</code> or transactional <code>Txn.Set*</code> invokes <code>HotRing.TouchAndClamp</code> with the limit. Once a key (optionally scoped by column family via <code>cfHotKey</code>) reaches the limit, the write is rejected with <code>utils.ErrHotKeyWriteThrottle</code>. If throttling is disabled but <code>HotWriteBurstThreshold &gt; 0</code>, the write ring still tracks frequency to enable hot write batching. This keeps pathological tenants or hot shards from overwhelming a single Raft group without adding heavyweight rate-limiters to the client stack.</p>
+<p><code>Options.WriteHotKeyLimit</code> wires the write-only HotRing into the write path. When set to a positive integer, every call to <code>DB.Set*</code>/<code>DB.SetEntry</code> invokes <code>HotRing.TouchAndClamp</code> with the limit. Once a key (optionally scoped by column family via <code>cfHotKey</code>) reaches the limit, the write is rejected with <code>utils.ErrHotKeyWriteThrottle</code>. If throttling is disabled but <code>HotWriteBurstThreshold &gt; 0</code>, the write ring still tracks frequency to enable hot write batching. This keeps pathological tenants or hot shards from overwhelming a single Raft group without adding heavyweight rate-limiters to the client stack.</p>
 <p>Operational hints:</p>
 <ul>
 <li><code>StatsSnapshot.Write.HotKeyLimited</code> and the CLI line <code>Write.HotKeyThrottled</code> expose how many writes were rejected since the process started.</li>
@@ -2111,159 +2071,269 @@ and a shorter window. You can disable it to inherit the global HotRing config:</
 zeros disable a feature (for example, rotation). If override is disabled, it
 inherits the global <code>HotRing*</code> configuration.</p>
 <div style="break-before: page; page-break-before: always;"></div>
-<h1 id="transaction--mvcc-design"><a class="header" href="#transaction--mvcc-design">Transaction &amp; MVCC Design</a></h1>
-<p>NoKV provides snapshot-isolated transactions backed by a lightweight <strong>oracle</strong> that hands out timestamps, tracks conflicts, and coordinates with the write pipeline. The implementation lives entirely in <a href="../txn.go"><code>txn.go</code></a> with metrics surfaced via <a href="../stats.go"><code>stats.go</code></a>.</p>
+<h1 id="percolator-distributed-transaction-design"><a class="header" href="#percolator-distributed-transaction-design">Percolator Distributed Transaction Design</a></h1>
+<p>This document explains NoKV’s distributed transaction path implemented by <code>percolator/</code> and executed through <code>raftstore</code>.</p>
+<p>The scope here is the current code path:</p>
+<ul>
+<li><code>Prewrite</code></li>
+<li><code>Commit</code></li>
+<li><code>BatchRollback</code></li>
+<li><code>ResolveLock</code></li>
+<li><code>CheckTxnStatus</code></li>
+<li>MVCC read visibility (<code>KvGet</code>/<code>KvScan</code> through <code>percolator.Reader</code>)</li>
+</ul>
+<p>It does not describe the removed standalone transaction API.</p>
 <hr>
-<h2 id="1-components-at-a-glance"><a class="header" href="#1-components-at-a-glance">1. Components at a Glance</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Component</th><th>Purpose</th><th>Key Functions</th></tr>
-</thead>
-<tbody>
-<tr><td><code>oracle</code></td><td>Issues read/commit timestamps, performs conflict checks, persists watermark progress.</td><td><a href="../txn.go#L80-L100"><code>readTs</code></a>, <a href="../txn.go#L142-L190"><code>newCommitTs</code></a>, <a href="../txn.go#L206-L208"><code>doneCommit</code></a></td></tr>
-<tr><td><code>Txn</code></td><td>User-facing transaction state: pending writes, read-set fingerprints, MVCC metadata.</td><td><a href="../txn.go#L412-L425"><code>SetEntry</code></a>, <a href="../txn.go#L428-L502"><code>Get</code></a>, <a href="../txn.go#L618-L671"><code>Commit</code></a></td></tr>
-<tr><td><code>pendingWritesIterator</code></td><td>Allows iterator merge to see unflushed txn writes.</td><td><a href="../txn.go#L324-L347"><code>newPendingWritesIterator</code></a></td></tr>
-<tr><td>Metrics</td><td>Tracks counts of started/committed/conflicted txns.</td><td><a href="../txn.go#L58-L66"><code>trackTxnStart</code></a>, <a href="../txn.go#L72-L78"><code>txnMetricsSnapshot</code></a></td></tr>
-</tbody>
-</table>
-</div>
-<p>The oracle is initialised during <code>DB.Open</code>, sharing lineage with BadgerDB’s MVCC model. Unlike RocksDB—which relies on WriteBatch/TwoPhaseCommit extensions—transactions are first-class citizens, and the core engine enforces ordering.</p>
-<hr>
-<h2 id="2-timestamp--conflict-flow"><a class="header" href="#2-timestamp--conflict-flow">2. Timestamp &amp; Conflict Flow</a></h2>
+<h2 id="1-where-it-runs"><a class="header" href="#1-where-it-runs">1. Where It Runs</a></h2>
+<p>Percolator logic is executed on the Raft apply path:</p>
+<ol>
+<li>Client sends TinyKV RPC (<code>KvPrewrite</code>, <code>KvCommit</code>, …).</li>
+<li><code>raftstore/kv/service.go</code> wraps it into a <code>RaftCmdRequest</code>.</li>
+<li>Store proposes command through Raft.</li>
+<li>On apply, <code>raftstore/kv/apply.go</code> dispatches to <code>percolator.*</code>.</li>
+</ol>
 <pre class="mermaid">sequenceDiagram
-    participant Client
-    participant DB
-    participant Oracle
-    participant Commit as commitWorker
-    participant Mgr as vlog.Manager
-    participant WAL
-    participant Mem as MemTable
-    Client-&gt;&gt;DB: NewTransaction(update)
-    DB-&gt;&gt;Oracle: readTs()
-    Oracle--&gt;&gt;DB: snapshot ts (nextTxnTs-1)
-    Client-&gt;&gt;DB: Set/Delete/Get
-    DB-&gt;&gt;Txn: stage pendingWrites, record read hashes
-    Client-&gt;&gt;DB: Commit
-    DB-&gt;&gt;Oracle: newCommitTs(txn)
-    alt conflict
-        Oracle--&gt;&gt;DB: ErrConflict
-    else success
-        Oracle--&gt;&gt;DB: commitTs
-        DB-&gt;&gt;Commit: batch requests
-        Commit-&gt;&gt;Mgr: AppendEntries(entries, writeMask)
-        Commit-&gt;&gt;WAL: Append(entries with commitTs)
-        Commit-&gt;&gt;Mem: apply to active memtable index
-        DB-&gt;&gt;Oracle: doneCommit(commitTs)
-    end
+    participant C as raftstore/client
+    participant S as kv.Service
+    participant R as Raft (leader-&gt;followers)
+    participant A as kv.Apply
+    participant P as percolator
+    participant DB as NoKV DB
+    C-&gt;&gt;S: KvPrewrite/KvCommit...
+    S-&gt;&gt;R: ProposeCommand(RaftCmdRequest)
+    R-&gt;&gt;A: Apply committed log
+    A-&gt;&gt;P: percolator.Prewrite/Commit...
+    P-&gt;&gt;DB: CFDefault/CFLock/CFWrite reads+writes
+    A--&gt;&gt;S: RaftCmdResponse
+    S--&gt;&gt;C: TinyKV RPC response
 </pre>
 
+<p>Key files:</p>
+<ul>
+<li><a href="../percolator/txn.go"><code>percolator/txn.go</code></a></li>
+<li><a href="../percolator/reader.go"><code>percolator/reader.go</code></a></li>
+<li><a href="../percolator/codec.go"><code>percolator/codec.go</code></a></li>
+<li><a href="../percolator/latch/latch.go"><code>percolator/latch/latch.go</code></a></li>
+<li><a href="../raftstore/kv/apply.go"><code>raftstore/kv/apply.go</code></a></li>
+<li><a href="../raftstore/client/client.go"><code>raftstore/client/client.go</code></a></li>
+</ul>
+<hr>
+<h2 id="2-mvcc-data-model"><a class="header" href="#2-mvcc-data-model">2. MVCC Data Model</a></h2>
+<p>NoKV uses three MVCC column families:</p>
+<ul>
+<li><code>CFDefault</code>: stores user values at <code>start_ts</code></li>
+<li><code>CFLock</code>: stores lock metadata at fixed <code>lockColumnTs = MaxUint64</code></li>
+<li><code>CFWrite</code>: stores commit records at <code>commit_ts</code></li>
+</ul>
+<h3 id="21-lock-record"><a class="header" href="#21-lock-record">2.1 Lock Record</a></h3>
+<p><code>percolator.Lock</code> (encoded by <code>EncodeLock</code>):</p>
+<ul>
+<li><code>Primary</code></li>
+<li><code>Ts</code> (start timestamp)</li>
+<li><code>TTL</code></li>
+<li><code>Kind</code> (<code>Put/Delete/Lock</code>)</li>
+<li><code>MinCommitTs</code></li>
+</ul>
+<h3 id="22-write-record"><a class="header" href="#22-write-record">2.2 Write Record</a></h3>
+<p><code>percolator.Write</code> (encoded by <code>EncodeWrite</code>):</p>
+<ul>
+<li><code>Kind</code></li>
+<li><code>StartTs</code></li>
+<li><code>ShortValue</code> (codec supports it; current commit path does not populate it)</li>
+</ul>
+<hr>
+<h2 id="3-concurrency-control-latches"><a class="header" href="#3-concurrency-control-latches">3. Concurrency Control: Latches</a></h2>
+<p>Before mutating keys, percolator acquires striped latches:</p>
+<ul>
+<li><code>latch.Manager</code> hashes keys to stripe mutexes.</li>
+<li>Stripes are deduplicated and acquired in sorted order to avoid deadlocks.</li>
+<li>Guard releases in reverse order.</li>
+</ul>
+<p>In <code>kv/apply.go</code>, one process-wide manager is used:</p>
+<ul>
+<li><code>defaultLatches = latch.NewManager(512)</code></li>
+</ul>
+<p>This serializes conflicting apply operations on overlapping keys in one node.</p>
+<hr>
+<h2 id="4-two-phase-commit-flow"><a class="header" href="#4-two-phase-commit-flow">4. Two-Phase Commit Flow</a></h2>
+<p>Client side (<code>raftstore/client.Client.TwoPhaseCommit</code>):</p>
 <ol>
-<li><strong>Start</strong> – <code>DB.newTransaction</code> calls <a href="../txn.go#L80-L100"><code>oracle.readTs</code></a>, which waits for all prior commits to finish (<code>txnMark.WaitForMark</code>) so new readers see a consistent snapshot. In distributed deployments, clients must obtain the <code>startVersion</code> themselves (see <a href="#timestamp-sources">Timestamp sources</a>).</li>
-<li><strong>Reads</strong> – <code>Txn.Get</code> first checks <code>pendingWrites</code>; otherwise it merges LSM iterators and value-log pointers under the read timestamp. For update transactions the read key fingerprint is recorded in <code>Txn.reads</code> via <a href="../txn.go#L511-L526"><code>addReadKey</code></a>.
-<code>Txn.Get</code> returns a detached entry view; callers must not call <code>DecrRef</code> on it.</li>
-<li><strong>Conflict detection</strong> – When <code>Options.DetectConflicts</code> is enabled, <code>oracle.newCommitTs</code> iterates <code>oracle.committedTxns</code> and compares read fingerprints against keys written by newer commits. This mirrors Badger’s optimistic strategy.</li>
-<li><strong>Commit timestamp</strong> – <code>newCommitTs</code> increments <code>nextTxnTs</code>, registers the commit in <code>txnMark</code>, and stores the conflict key set for future comparisons.</li>
-<li><strong>Apply</strong> – <code>Txn.commitAndSend</code> assigns the commit timestamp to each pending entry (<code>kv.KeyWithTs</code>), enqueues them through <code>sendToWriteCh</code>, and returns a callback that waits for the batch completion. Only after the callback runs does the oracle’s <code>doneCommit</code> release the commit watermark.</li>
-<li><strong>Value log ordering</strong> – As with non-transactional writes, the commit worker runs <code>valueLog.write</code> (which calls <code>Manager.AppendEntries</code>) before the WAL append. On failure <code>vlog.manager.Rewind</code> ensures partial writes do not leak.</li>
+<li>Group mutations by region.</li>
+<li>Prewrite primary region.</li>
+<li>Prewrite secondary regions.</li>
+<li>Commit primary region.</li>
+<li>Commit secondary regions.</li>
 </ol>
-<p>RocksDB’s default WriteBatch lacks conflict detection, relying on application-level locking; NoKV ships with snapshot isolation and optional detection, similar to Badger’s <code>Txn</code> but with integrated metrics and iterator pooling.</p>
-<hr>
-<h2 id="3-data-structures"><a class="header" href="#3-data-structures">3. Data Structures</a></h2>
-<h3 id="oracle-watermarks"><a class="header" href="#oracle-watermarks">Oracle Watermarks</a></h3>
-<pre><code class="language-text">oracle{
-  nextTxnTs       // next commit timestamp to assign
-  txnMark         // watermark waiting for WAL/vlog durability
-  readMark        // tracks oldest active read timestamp
-  committedTxns[] // sliding window of conflict key sets
-}
-</code></pre>
-<ul>
-<li><code>txnMark</code> / <code>readMark</code> are <code>utils.WaterMark</code> instances. They guarantee all writes with timestamp ≤ <code>readTs</code> are durable before a new read snapshot begins, mirroring Badger’s approach to avoid reading half-committed data.</li>
-<li><code>cleanupCommittedTransactions</code> prunes conflict history based on the oldest outstanding read, preventing unbounded memory use.</li>
-</ul>
-<h3 id="txn-state"><a class="header" href="#txn-state">Txn State</a></h3>
-<pre><code class="language-go">type Txn struct {
-    readTs   uint64
-    commitTs uint64
-    pendingWrites map[string]*kv.Entry
-    conflictKeys  map[uint64]struct{}
-    reads         []uint64
-    numIterators  int32
-    discarded     bool
-    update        bool
-}
-</code></pre>
-<ul>
-<li>Pending writes retain the caller’s entry pointers until commit; NoKV copies values only when moving them into the write batch.</li>
-<li>Read fingerprints use <code>kv.MemHash</code>, so conflict detection is order-independent and compact.</li>
-<li>MVCC versions are encoded in the key suffix (<code>KeyWithTs</code>), matching the LSM’s descending version order.</li>
-</ul>
-<h3 id="iterator-integration"><a class="header" href="#iterator-integration">Iterator Integration</a></h3>
-<ul>
-<li><code>Txn.newPendingWritesIterator</code> materialises staged entries as a sorted slice, allowing transaction iterators to merge them with memtables/SST tables. This ensures <code>Txn.NewIterator</code> sees writes immediately without affecting other snapshots.</li>
-<li><code>Txn.numIterators</code> enforces that all iterators close before commit/discard—helpful for catching resource leaks in tests (<code>txn_iterator_test.go</code>).</li>
-</ul>
-<hr>
-<h2 id="4-commit--error-handling"><a class="header" href="#4-commit--error-handling">4. Commit &amp; Error Handling</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Stage</th><th>Failure Handling</th></tr>
-</thead>
-<tbody>
-<tr><td>Conflict</td><td><code>oracle.newCommitTs</code> returns <code>(0, true)</code>; <code>Txn.Commit</code> surfaces <code>utils.ErrConflict</code> and leaves state untouched.</td></tr>
-<tr><td>Value log append</td><td><code>valueLog.write</code> rewinds via <code>Manager.Rewind</code>; <code>req.Wait</code> returns the error so callers can retry safely.</td></tr>
-<tr><td>WAL append</td><td><code>sendToWriteCh</code> propagates WAL errors; commit watermark is cleared immediately in that case.</td></tr>
-<tr><td>Callback mode</td><td><code>Txn.CommitWith</code> schedules <code>runTxnCallback</code> on a goroutine; user callbacks always execute (success or error).</td></tr>
-</tbody>
-</table>
-</div>
-<p>The final call to <code>Txn.Discard</code> runs regardless of success, marking the read watermark done and decrementing the oracle’s active counter.</p>
-<hr>
-<h2 id="5-comparisons-1"><a class="header" href="#5-comparisons-1">5. Comparisons</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Feature</th><th>RocksDB</th><th>BadgerDB</th><th>NoKV</th></tr>
-</thead>
-<tbody>
-<tr><td>Isolation</td><td>Optional (WritePrepared/2PC)</td><td>Snapshot isolation</td><td>Snapshot isolation with <code>WaterMark</code> barriers</td></tr>
-<tr><td>Conflict detection</td><td>External</td><td>Optional optimistic</td><td>Optional optimistic keyed by <code>utils.MemHash</code></td></tr>
-<tr><td>Iterator view</td><td>Snapshot handles, manual merging</td><td>Built-in</td><td>Built-in with pending write iterator</td></tr>
-<tr><td>Metrics</td><td><code>rocksdb.transactions.*</code> when enabled</td><td>Basic stats</td><td><code>NoKV.Stats.txn.*</code> + CLI</td></tr>
-</tbody>
-</table>
-</div>
-<p>NoKV inherits Badger’s optimistic concurrency but strengthens durability ordering by coupling commits with the same write pipeline that non-transactional writes use. Compared with RocksDB’s transactional library, the Go implementation remains lightweight and requires no external locks.</p>
-<hr>
-<h2 id="6-operational-notes-2"><a class="header" href="#6-operational-notes-2">6. Operational Notes</a></h2>
-<ul>
-<li><strong>Long-running reads</strong>: watch <code>NoKV.Stats.txn.active</code> and <code>oracle.readMark.DoneUntil()</code>—slow consumers keep old versions alive, delaying vlog GC and compaction reclamation.</li>
-<li><strong>Non-transactional APIs</strong>: <code>DB.Set/Get/Del</code> and <code>SetCF/GetCF/DelCF</code> use a MaxUint64 sentinel version for “latest”. Do not mix these writes with MVCC/Txn writes in the same database.</li>
-<li><strong>Managed mode</strong>: exposing <code>Txn.SetEntry</code> with pre-set versions allows replication/replay flows. Because commit timestamps may diverge, transaction markers are only set when all entries share a single commitTs.</li>
-<li><strong>Throttling</strong>: combine <code>HotRing.TouchAndClamp</code> with per-transaction analytics to detect hot-key write storms that lead to frequent conflicts.</li>
-</ul>
-<p>See <a href="#transactions"><code>docs/testing.md</code></a> for the regression matrix covering conflict detection, iterator semantics, and managed timestamps.</p>
-<hr>
-<h2 id="7-timestamp-sources"><a class="header" href="#7-timestamp-sources">7. Timestamp Sources</a></h2>
-<p>Replica nodes do <strong>not</strong> generate timestamps during TinyKV RPC handling; the values sent in <code>KvPrewrite</code>/<code>KvCommit</code> are applied verbatim. For teaching and prototyping you can pick from two approaches:</p>
-<ul>
-<li>
-<p><strong>Single-client experiments</strong> – choose monotonically increasing integers in your client code (as shown in <code>raftstore/client/client_test.go</code>).</p>
-</li>
-<li>
-<p><strong>Shared allocator</strong> – run the sample TSO service under <code>scripts/tso</code> to hand out globally increasing timestamps:</p>
-<pre><code class="language-bash">go run ./scripts/tso --addr 127.0.0.1:9494 --start 100
+<pre class="mermaid">sequenceDiagram
+    participant Cli as Client
+    participant R1 as Region(primary)
+    participant R2 as Region(secondary)
+    Cli-&gt;&gt;R1: Prewrite(primary + local muts)
+    Cli-&gt;&gt;R2: Prewrite(secondary muts)
+    Cli-&gt;&gt;R1: Commit(keys,startTs,commitTs)
+    Cli-&gt;&gt;R2: Commit(keys,startTs,commitTs)
+</pre>
 
-# request one timestamp
-curl -s http://127.0.0.1:9494/tso
-# request a batch of 16
-curl -s "http://127.0.0.1:9494/tso?batch=16"
-</code></pre>
-<p>Each call returns JSON (<code>{"timestamp":123,"count":1}</code>), where <code>timestamp</code> is the first value in the allocated range. Clients can use the first value for <code>startVersion</code>, or the entire range to provision multiple transactions. This keeps the learning focus on the Percolator flow while demonstrating how production systems would obtain globally ordered timestamps.</p>
-</li>
+<hr>
+<h2 id="5-write-side-operations"><a class="header" href="#5-write-side-operations">5. Write-Side Operations</a></h2>
+<h2 id="51-prewrite"><a class="header" href="#51-prewrite">5.1 Prewrite</a></h2>
+<p><code>Prewrite</code> runs mutation-by-mutation:</p>
+<ol>
+<li>Check existing lock on key:
+<ul>
+<li>if lock exists with different <code>Ts</code> -&gt; <code>KeyError.Locked</code></li>
 </ul>
+</li>
+<li>Check latest committed write:
+<ul>
+<li>if <code>commit_ts &gt;= req.start_version</code> -&gt; <code>WriteConflict</code></li>
+</ul>
+</li>
+<li>Apply data intent:
+<ul>
+<li><code>Put</code>: write value into <code>CFDefault</code> at <code>start_ts</code></li>
+<li><code>Delete</code>/<code>Lock</code>: delete default value at <code>start_ts</code> (if exists)</li>
+</ul>
+</li>
+<li>Write lock into <code>CFLock</code> at <code>lockColumnTs</code></li>
+</ol>
+<h3 id="52-commit"><a class="header" href="#52-commit">5.2 Commit</a></h3>
+<p>For each key:</p>
+<ol>
+<li>Read lock</li>
+<li>If no lock:
+<ul>
+<li>if write with same <code>start_ts</code> exists -&gt; idempotent success</li>
+<li>else -&gt; abort (<code>lock not found</code>)</li>
+</ul>
+</li>
+<li>If lock <code>Ts != start_version</code> -&gt; <code>KeyError.Locked</code></li>
+<li><code>commitKey</code>:
+<ul>
+<li>if <code>min_commit_ts &gt; commit_version</code> -&gt; <code>CommitTsExpired</code></li>
+<li>if write with same <code>start_ts</code> already exists:
+<ul>
+<li>rollback write -&gt; abort</li>
+<li>write with different commit ts -&gt; treat success, clean lock</li>
+<li>same commit ts -&gt; success</li>
+</ul>
+</li>
+<li>else write <code>CFWrite[key@commit_ts] = {kind,start_ts}</code></li>
+<li>remove lock from <code>CFLock</code></li>
+</ul>
+</li>
+</ol>
+<h3 id="53-batchrollback"><a class="header" href="#53-batchrollback">5.3 BatchRollback</a></h3>
+<p>For each key:</p>
+<ol>
+<li>If already has write at <code>start_ts</code>:
+<ul>
+<li>rollback marker already exists -&gt; success</li>
+<li>non-rollback write exists -&gt; success (already committed)</li>
+</ul>
+</li>
+<li>Remove lock (if any)</li>
+<li>Remove default value at <code>start_ts</code> (if any)</li>
+<li>Write rollback marker to <code>CFWrite</code> at <code>start_ts</code></li>
+</ol>
+<h3 id="54-resolvelock"><a class="header" href="#54-resolvelock">5.4 ResolveLock</a></h3>
+<ul>
+<li><code>commit_version == 0</code> -&gt; rollback matching locks</li>
+<li><code>commit_version &gt; 0</code> -&gt; commit matching locks</li>
+<li>Returns number of resolved keys</li>
+</ul>
+<hr>
+<h2 id="6-transaction-status-check"><a class="header" href="#6-transaction-status-check">6. Transaction Status Check</a></h2>
+<p><code>CheckTxnStatus</code> targets the primary key and decides whether txn is alive, committed, or should be rolled back.</p>
+<p>Decision order:</p>
+<ol>
+<li>Read lock on primary</li>
+<li>If lock exists but <code>lock.ts != req.lock_ts</code> -&gt; <code>KeyError.Locked</code></li>
+<li>If lock exists and TTL expired (<code>current_ts &gt;= lock.ts + ttl</code>):
+<ul>
+<li>rollback primary</li>
+<li>action = <code>TTLExpireRollback</code></li>
+</ul>
+</li>
+<li>If lock exists and caller pushes timestamp:
+<ul>
+<li><code>min_commit_ts = max(min_commit_ts, caller_start_ts+1)</code></li>
+<li>action = <code>MinCommitTsPushed</code></li>
+</ul>
+</li>
+<li>If no lock, check write by <code>start_ts</code>:
+<ul>
+<li>committed write -&gt; return <code>commit_version</code></li>
+<li>rollback write -&gt; action <code>LockNotExistRollback</code></li>
+</ul>
+</li>
+<li>If no lock and no write, and <code>rollback_if_not_exist</code> is true:
+<ul>
+<li>write rollback marker</li>
+<li>action <code>LockNotExistRollback</code></li>
+</ul>
+</li>
+</ol>
+<hr>
+<h2 id="7-read-path-semantics-mvcc-visibility"><a class="header" href="#7-read-path-semantics-mvcc-visibility">7. Read Path Semantics (MVCC Visibility)</a></h2>
+<p><code>KvGet</code> and <code>KvScan</code> read through <code>percolator.Reader</code>:</p>
+<ol>
+<li>Check lock first:
+<ul>
+<li>if lock exists and <code>read_ts &gt;= lock.ts</code>, return locked error</li>
+</ul>
+</li>
+<li>Find visible write in <code>CFWrite</code>:
+<ul>
+<li>latest <code>commit_ts &lt;= read_ts</code></li>
+</ul>
+</li>
+<li>Interpret write kind:
+<ul>
+<li><code>Delete</code>/<code>Rollback</code> =&gt; not found</li>
+<li><code>Put</code> =&gt; read value from <code>CFDefault</code> at <code>start_ts</code></li>
+</ul>
+</li>
+</ol>
+<p>Notes:</p>
+<ul>
+<li><code>KvScan</code> currently rejects reverse scan.</li>
+<li><code>scanWrites</code> uses internal iterator over <code>CFWrite</code>.</li>
+</ul>
+<hr>
+<h2 id="8-error-and-idempotency-behavior"><a class="header" href="#8-error-and-idempotency-behavior">8. Error and Idempotency Behavior</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Operation</th><th>Idempotency/Conflict behavior</th></tr>
+</thead>
+<tbody>
+<tr><td>Prewrite</td><td>Rejects lock conflicts and write conflicts; returns per-key <code>KeyError</code> list.</td></tr>
+<tr><td>Commit</td><td>Idempotent for already committed keys with same <code>start_ts</code>; stale/missing lock may abort.</td></tr>
+<tr><td>BatchRollback</td><td>Safe to repeat; rollback marker prevents duplicate side effects.</td></tr>
+<tr><td>ResolveLock</td><td>Safe to retry per key set; resolves only matching <code>start_ts</code> locks.</td></tr>
+<tr><td>CheckTxnStatus</td><td>May push <code>min_commit_ts</code>, rollback expired primary lock, or return committed version.</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="9-current-constraints"><a class="header" href="#9-current-constraints">9. Current Constraints</a></h2>
+<ul>
+<li>This path is distributed-only and tied to TinyKV RPC + Raft apply.</li>
+<li>Standalone/local transaction APIs are intentionally removed.</li>
+<li>Latch scope is per-node process (<code>defaultLatches</code>), with region-level correctness coming from Raft sequencing.</li>
+<li><code>Write.ShortValue</code> is encoded/decoded but not used by current commit writer.</li>
+</ul>
+<hr>
+<h2 id="10-validation-and-tests"><a class="header" href="#10-validation-and-tests">10. Validation and Tests</a></h2>
+<p>Primary coverage:</p>
+<ul>
+<li><a href="../percolator/txn_test.go"><code>percolator/txn_test.go</code></a></li>
+<li><a href="../raftstore/kv/service_test.go"><code>raftstore/kv/service_test.go</code></a></li>
+<li><a href="../raftstore/client/client_test.go"><code>raftstore/client/client_test.go</code></a></li>
+<li><a href="../raftstore/server/server_test.go"><code>raftstore/server/server_test.go</code></a></li>
+</ul>
+<p>These tests cover 2PC happy path, lock conflicts, status checks, resolve/rollback behavior, and client region-aware retries.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="raftstore-deep-dive"><a class="header" href="#raftstore-deep-dive">RaftStore Deep Dive</a></h1>
 <p><code>raftstore</code> powers NoKV’s distributed mode by layering multi-Raft replication on top of the embedded storage engine. This note explains the major packages, the boot and command paths, how transport and storage interact, and the supporting tooling for observability and testing.</p>
@@ -2367,7 +2437,7 @@ curl -s "http://127.0.0.1:9494/tso?batch=16"
 <li>Region-aware routing with NotLeader/EpochNotMatch retry.</li>
 <li><code>Mutate</code> splits mutations by region and performs two-phase commit (primary first). <code>Put</code> / <code>Delete</code> are convenience wrappers.</li>
 <li><code>Scan</code> transparently walks region boundaries.</li>
-<li>End-to-end coverage lives in <code>raftstore/server/server_client_integration_test.go</code>, which launches real servers, uses the client to write and delete keys, and verifies the results.</li>
+<li>End-to-end coverage lives in <code>raftstore/server/server_test.go</code>, which launches real servers, uses the client to write and delete keys, and verifies the results.</li>
 </ul>
 <hr>
 <h2 id="8-control-plane--region-operations"><a class="header" href="#8-control-plane--region-operations">8. Control Plane &amp; Region Operations</a></h2>
@@ -2375,10 +2445,11 @@ curl -s "http://127.0.0.1:9494/tso?batch=16"
 <ul>
 <li>Topology is sourced from <code>raft_config.example.json</code> (via <code>config.LoadFile</code>) and
 reused by scripts, Docker Compose, and the Redis gateway.</li>
-<li>The client builds a static region map (<code>[]RegionConfig</code>) and store endpoints
-from the same file; there is no dynamic PD-style reconfiguration today.</li>
-<li>The built-in scheduler currently emits leader-transfer operations only
-(see <code>raftstore/scheduler</code>), acting as a minimal control plane.</li>
+<li>Runtime routing is PD-first: <code>raftstore/client</code> resolves Regions by key through
+<code>GetRegionByKey</code> and caches route entries for retries.</li>
+<li><code>raft_config</code> regions are treated as bootstrap/deployment metadata and are not
+the runtime source of truth once PD is available.</li>
+<li>PD is the only control-plane source of truth for runtime scheduling/routing.</li>
 </ul>
 <h3 id="82-split--merge"><a class="header" href="#82-split--merge">8.2 Split / Merge</a></h3>
 <ul>
@@ -2416,7 +2487,7 @@ heuristics; a higher-level controller could call the same APIs.</li>
 <tr><td>Command pipeline</td><td><a href="../raftstore/store/command_pipeline.go"><code>command_pipeline.go</code></a></td><td>Assigns request IDs, records proposals, matches apply results, returns responses/errors to callers.</td></tr>
 <tr><td>Region manager</td><td><a href="../raftstore/store/region_manager.go"><code>region_manager.go</code></a></td><td>Validates state transitions, writes manifest edits, updates peer metadata, triggers region hooks.</td></tr>
 <tr><td>Operation scheduler</td><td><a href="../raftstore/store/operation_scheduler.go"><code>operation_scheduler.go</code></a></td><td>Buffers planner output, enforces cooldown &amp; burst limits, dispatches leader transfers or other operations.</td></tr>
-<tr><td>Heartbeat loop</td><td><a href="../raftstore/store/heartbeat_loop.go"><code>heartbeat_loop.go</code></a></td><td>Periodically publishes region/store heartbeats and re-runs the planner to produce scheduling actions.</td></tr>
+<tr><td>Heartbeat loop</td><td><a href="../raftstore/store/heartbeat_loop.go"><code>heartbeat_loop.go</code></a></td><td>Periodically publishes region/store heartbeats and, when the sink implements planner capability, drains scheduling actions.</td></tr>
 </tbody>
 </table>
 </div>
@@ -2425,114 +2496,215 @@ heuristics; a higher-level controller could call the same APIs.</li>
 <ul>
 <li><strong>Adding peers</strong>: update the manifest with new Region metadata, then call <code>Store.StartPeer</code> on the target node.</li>
 <li><strong>Follower or lease reads</strong>: extend <code>ReadCommand</code> to include ReadIndex or leader lease checks; current design only serves leader reads.</li>
-<li><strong>Scheduler integration</strong>: pair <code>RegionSnapshot()</code> and <code>RegionMetrics()</code> with an external scheduler (PD-like) for dynamic balancing.</li>
+<li><strong>Scheduler integration</strong>: use PD as the cluster coordinator and operation source.</li>
 </ul>
 <p>This layering keeps the embedded storage engine intact while providing a production-ready replication path, robust observability, and straightforward integration in both CLI and programmatic contexts.</p>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="pd-lite"><a class="header" href="#pd-lite">PD-lite</a></h1>
+<p><code>PD-lite</code> is NoKV’s control-plane service for distributed mode.<br>It exposes a gRPC API (<code>pb.PD</code>) and is started by:</p>
+<pre><code class="language-bash">go run ./cmd/nokv pd --addr 127.0.0.1:2379
+</code></pre>
+<hr>
+<h2 id="1-responsibilities-1"><a class="header" href="#1-responsibilities-1">1. Responsibilities</a></h2>
+<p>PD-lite currently owns:</p>
+<ul>
+<li><strong>Routing</strong>: <code>GetRegionByKey</code></li>
+<li><strong>Heartbeats</strong>: <code>StoreHeartbeat</code>, <code>RegionHeartbeat</code></li>
+<li><strong>Region removal</strong>: <code>RemoveRegion</code></li>
+<li><strong>ID service</strong>: <code>AllocID</code></li>
+<li><strong>TSO</strong>: <code>Tso</code></li>
+</ul>
+<p>Runtime clients (for example <code>cmd/nokv-redis</code> raft backend) use PD as the
+routing source of truth.</p>
+<hr>
+<h2 id="2-runtime-architecture"><a class="header" href="#2-runtime-architecture">2. Runtime Architecture</a></h2>
+<pre class="mermaid">flowchart LR
+    Store["nokv serve"] --&gt;|"StoreHeartbeat / RegionHeartbeat"| PD["PD-lite (gRPC)"]
+    Gateway["nokv-redis (raft mode)"] --&gt;|"GetRegionByKey / Tso"| PD
+    PD --&gt; Cluster["pd/core.Cluster"]
+    Cluster --&gt; Scheduler["leader-transfer hint planner"]
+</pre>
+
+<p>Core implementation units:</p>
+<ul>
+<li><code>pd/core</code>: in-memory cluster metadata model + allocators.</li>
+<li><code>pd/storage</code>: persistence abstraction (<code>Store</code>) with local manifest+state implementation.</li>
+<li><code>pd/server</code>: gRPC service + RPC validation/error mapping.</li>
+<li><code>pd/client</code>: client wrapper used by store/gateway.</li>
+<li><code>pd/adapter</code>: scheduler sink that forwards heartbeats into PD.</li>
+</ul>
+<hr>
+<h2 id="3-persistence---workdir"><a class="header" href="#3-persistence---workdir">3. Persistence (<code>--workdir</code>)</a></h2>
+<p>When <code>--workdir</code> is provided, PD-lite persists control-plane state:</p>
+<ul>
+<li><strong>Region catalog</strong> via manifest edits.</li>
+<li><strong>Allocator checkpoints</strong> via <code>PD_STATE.json</code>:
+<ul>
+<li><code>id_current</code></li>
+<li><code>ts_current</code></li>
+</ul>
+</li>
+</ul>
+<p>Startup flow:</p>
+<ol>
+<li>Open <code>pd/storage</code> with <code>--workdir</code>.</li>
+<li>Load snapshot (<code>regions</code> + allocator counters).</li>
+<li>Compute starts as <code>max(cli_start, checkpoint+1)</code>.</li>
+<li>Replay region snapshot into <code>pd/core.Cluster</code>.</li>
+</ol>
+<p>This avoids allocator rollback after restart and keeps route metadata stable.</p>
+<hr>
+<h2 id="4-config-integration"><a class="header" href="#4-config-integration">4. Config Integration</a></h2>
+<p><code>raft_config.json</code> supports PD endpoint + workdir defaults:</p>
+<pre><code class="language-json">"pd": {
+  "addr": "127.0.0.1:2379",
+  "docker_addr": "nokv-pd:2379",
+  "work_dir": "./artifacts/cluster/pd",
+  "docker_work_dir": "/var/lib/nokv-pd"
+}
+</code></pre>
+<p>Resolution rules:</p>
+<ul>
+<li>CLI override wins.</li>
+<li>Otherwise read from config by scope (<code>host</code> / <code>docker</code>).</li>
+</ul>
+<p>Helpers:</p>
+<ul>
+<li><code>config.ResolvePDAddr(scope)</code></li>
+<li><code>config.ResolvePDWorkDir(scope)</code></li>
+<li><code>nokv-config pd --field addr|workdir --scope host|docker</code></li>
+</ul>
+<hr>
+<h2 id="5-routing-source-convergence"><a class="header" href="#5-routing-source-convergence">5. Routing Source Convergence</a></h2>
+<p>NoKV now uses <strong>PD-first routing</strong>:</p>
+<ul>
+<li><code>raftstore/client</code> resolves regions with <code>GetRegionByKey</code>.</li>
+<li><code>raft_config</code> regions are bootstrap/deployment metadata.</li>
+<li>Runtime route truth comes from PD heartbeats + PD region catalog.</li>
+</ul>
+<p>This avoids dual sources drifting over time (config vs PD).</p>
+<hr>
+<h2 id="6-serve-mode-semantics"><a class="header" href="#6-serve-mode-semantics">6. Serve Mode Semantics</a></h2>
+<p><code>nokv serve</code> is now PD-only:</p>
+<ul>
+<li><code>--pd-addr</code> is required.</li>
+<li>Runtime routing/scheduling control-plane state is sourced from PD.</li>
+</ul>
+<p>Related CLI behavior:</p>
+<ul>
+<li>Inspect control-plane state through PD APIs/metrics.</li>
+</ul>
+<hr>
+<h2 id="7-comparison-tinykv--tikv"><a class="header" href="#7-comparison-tinykv--tikv">7. Comparison: TinyKV / TiKV</a></h2>
+<h3 id="tinykv-teaching-stack"><a class="header" href="#tinykv-teaching-stack">TinyKV (teaching stack)</a></h3>
+<ul>
+<li>Uses a scheduler server (<code>tinyscheduler</code>) as separate process.</li>
+<li>Control plane integrates embedded etcd for metadata persistence.</li>
+<li>Educational architecture, minimal production hardening.</li>
+</ul>
+<h3 id="tikv-production-stack"><a class="header" href="#tikv-production-stack">TiKV (production stack)</a></h3>
+<ul>
+<li>PD is an independent, highly available cluster.</li>
+<li>PD internally uses etcd Raft for durable metadata + leader election.</li>
+<li>Rich scheduling and balancing policies, rolling updates, robust ops tooling.</li>
+</ul>
+<h3 id="nokv-pd-lite-current"><a class="header" href="#nokv-pd-lite-current">NoKV PD-lite (current)</a></h3>
+<ul>
+<li>Single PD-lite process with optional local persistence (<code>--workdir</code>).</li>
+<li>Sufficient for local clusters, testing, and architecture iteration.</li>
+<li>API shape intentionally aligned with a PD-style control plane so migration to
+stronger HA semantics is incremental.</li>
+</ul>
+<hr>
+<h2 id="8-current-limitations--next-steps"><a class="header" href="#8-current-limitations--next-steps">8. Current Limitations / Next Steps</a></h2>
+<ul>
+<li>No multi-PD quorum and no automatic PD failover.</li>
+<li>Scheduler policy is intentionally small (leader transfer focused).</li>
+<li>No advanced placement constraints yet.</li>
+</ul>
+<p>These are deliberate scope limits for a fast-moving experimental platform.</p>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="crash-recovery-playbook"><a class="header" href="#crash-recovery-playbook">Crash Recovery Playbook</a></h1>
-<p>This playbook documents how NoKV rebuilds state after a crash and which automated checks ensure correctness. It ties together WAL replay, manifest reconciliation, ValueLog GC, and flush pipelines—mirroring RocksDB’s layered recovery while incorporating Badger-style value log hygiene.</p>
+<p>This document describes how NoKV restores state after abnormal exit, and which tests validate each recovery contract.</p>
 <hr>
 <h2 id="1-recovery-phases"><a class="header" href="#1-recovery-phases">1. Recovery Phases</a></h2>
 <pre class="mermaid">flowchart TD
     Start[DB.Open]
     Verify[runRecoveryChecks]
-    Manifest[manifest.Open → replay]
-    WAL[wal.Manager.Replay]
-    VLog[valueLog.recover]
-    Flush[Recreate memtables]
-    Stats[Stats.StartStats]
+    WalOpen[wal.Open]
+    LSM[lsm.NewLSM]
+    Manifest[manifest replay + table load]
+    WALReplay[WAL replay to memtables]
+    VLog[valueLog recover]
+    Flush[submit immutable flush backlog]
+    Stats[stats/start background loops]
 
-    Start --&gt; Verify --&gt; Manifest --&gt; WAL --&gt; VLog --&gt; Flush --&gt; Stats
+    Start --&gt; Verify --&gt; WalOpen --&gt; LSM --&gt; Manifest --&gt; WALReplay --&gt; VLog --&gt; Flush --&gt; Stats
 </pre>
 
 <ol>
-<li><strong>Directory verification</strong> – <code>DB.runRecoveryChecks</code> calls <code>manifest.Verify</code>, <code>wal.VerifyDir</code>, and initialises the vlog directory. Missing directories fail fast.</li>
-<li><strong>Manifest replay</strong> – <code>manifest.Open</code> reads <code>CURRENT</code>, replays <code>EditAddFile/DeleteFile</code>, <code>EditLogPointer</code>, and vlog edits into an in-memory <code>Version</code>.</li>
-<li><strong>WAL replay</strong> – <code>wal.Manager.Replay</code> processes segments newer than the manifest checkpoint, rebuilding memtables from committed entries.</li>
-<li><strong>ValueLog reconciliation</strong> – <code>valueLog.recover</code> scans existing <code>.vlog</code> files, drops segments marked invalid, and trims torn tails to the last valid entry.</li>
-<li><strong>Flush backlog</strong> – Immutable memtables recreated from WAL are resubmitted to <code>flush.Manager</code>; temporary <code>.sst.tmp</code> files are either reinstalled or cleaned up.</li>
-<li><strong>Stats bootstrap</strong> – the metrics goroutine restarts so CLI commands immediately reflect queue backlogs and GC status.</li>
+<li><strong>Pre-flight verification</strong>: <code>DB.runRecoveryChecks</code> runs <code>manifest.Verify</code>, <code>wal.VerifyDir</code>, and per-bucket <code>vlog.VerifyDir</code>.</li>
+<li><strong>WAL manager reopen</strong>: <code>wal.Open</code> reopens latest segment and rebuilds counters.</li>
+<li><strong>Manifest replay + SST load</strong>: <code>levelManager.build</code> replays manifest version and opens SST files.</li>
+<li><strong>Stale SST cleanup</strong>: if a manifest SST is missing or unreadable/corrupt, it is marked stale and removed from manifest (<code>EditDeleteFile</code>) so startup can continue.</li>
+<li><strong>WAL replay</strong>: <code>lsm.recovery</code> replays post-checkpoint WAL records into memtables.</li>
+<li><strong>Flush backlog restore</strong>: recovered immutable memtables are resubmitted to <code>flush.Manager</code>.</li>
+<li><strong>ValueLog recovery</strong>: value-log managers reconcile on-disk files with manifest metadata, trim torn tails, and drop stale/orphan segments.</li>
+<li><strong>Runtime restart</strong>: metrics and periodic workers start again.</li>
 </ol>
-<p>This mirrors RocksDB’s <code>DBImpl::Recover</code> while extending to handle value log metadata automatically.</p>
 <hr>
-<h2 id="2-failure-scenarios--expected-outcomes"><a class="header" href="#2-failure-scenarios--expected-outcomes">2. Failure Scenarios &amp; Expected Outcomes</a></h2>
+<h2 id="2-failure-scenarios--tests"><a class="header" href="#2-failure-scenarios--tests">2. Failure Scenarios &amp; Tests</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Failure Point</th><th>Example Simulation</th><th>Expected Recovery Behaviour</th><th>Tests</th></tr>
+<tr><th>Failure Point</th><th>Expected Recovery Behaviour</th><th>Tests</th></tr>
 </thead>
 <tbody>
-<tr><td>WAL tail truncation</td><td>truncate last 2 bytes of <code>000005.wal</code></td><td>Replay stops at truncated record, previously flushed SST remains intact</td><td><code>wal/manager_test.go::TestReplayTruncatedTail</code></td></tr>
-<tr><td>Flush crash before install</td><td>crash after writing <code>.sst.tmp</code></td><td>WAL replay rebuilds memtable; temp file removed; no manifest edit present</td><td><code>db_test.go::TestRecoveryWALReplayRestoresData</code></td></tr>
-<tr><td>Flush crash after install</td><td>crash after logging manifest edit but before WAL release</td><td>Manifest still lists SST; recovery verifies file exists and releases WAL on reopen</td><td><code>db_test.go::TestRecoveryCleansMissingSSTFromManifest</code></td></tr>
-<tr><td>ValueLog GC crash</td><td>delete edit written, file still on disk</td><td>Recovery removes stale <code>.vlog</code> file and keeps manifest consistent</td><td><code>db_test.go::TestRecoveryRemovesStaleValueLogSegment</code></td></tr>
-<tr><td>Manifest rewrite crash</td><td>new MANIFEST written, CURRENT not updated</td><td>Recovery keeps using old manifest; stale temp file cleaned</td><td><code>db_test.go::TestRecoveryManifestRewriteCrash</code></td></tr>
-<tr><td>Transaction in-flight</td><td>crash between WAL append and memtable update</td><td>WAL replay reapplies entry; transactions remain atomic because commit order is vlog → WAL → memtable</td><td><code>txn_test.go::TestTxnCommitPersists</code></td></tr>
+<tr><td>WAL tail truncated</td><td>Replay stops safely at truncated tail, preserving valid prefix records</td><td><code>wal/manager_test.go::TestManagerReplayHandlesTruncate</code></td></tr>
+<tr><td>Crash before memtable flush install</td><td>WAL replay restores user data not yet flushed to SST</td><td><code>db_test.go::TestRecoveryWALReplayRestoresData</code></td></tr>
+<tr><td>Manifest references missing SST</td><td>Startup removes stale manifest entry and continues</td><td><code>db_test.go::TestRecoveryCleansMissingSSTFromManifest</code></td></tr>
+<tr><td>Manifest references corrupt/unreadable SST</td><td>Startup removes stale entry and continues</td><td><code>db_test.go::TestRecoveryCleansCorruptSSTFromManifest</code></td></tr>
+<tr><td>ValueLog stale segment (manifest marked invalid)</td><td>Recovery deletes stale file from disk</td><td><code>db_test.go::TestRecoveryRemovesStaleValueLogSegment</code></td></tr>
+<tr><td>ValueLog orphan segment (disk only)</td><td>Recovery deletes orphan file not tracked by manifest</td><td><code>db_test.go::TestRecoveryRemovesOrphanValueLogSegment</code></td></tr>
+<tr><td>Manifest rewrite interrupted</td><td>Recovery keeps using CURRENT-selected manifest and data remains readable</td><td><code>db_test.go::TestRecoveryManifestRewriteCrash</code></td></tr>
+<tr><td>ValueLog contains records absent from LSM/WAL</td><td>Recovery does not replay vlog as source-of-truth</td><td><code>db_test.go::TestRecoverySkipsValueLogReplay</code></td></tr>
 </tbody>
 </table>
 </div>
 <hr>
-<h2 id="3-automation--tooling"><a class="header" href="#3-automation--tooling">3. Automation &amp; Tooling</a></h2>
-<h3 id="31-go-test-matrix"><a class="header" href="#31-go-test-matrix">3.1 Go Test Matrix</a></h3>
-<pre><code class="language-bash">GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./... -run 'Recovery'
+<h2 id="3-recovery-tooling"><a class="header" href="#3-recovery-tooling">3. Recovery Tooling</a></h2>
+<h3 id="31-targeted-tests"><a class="header" href="#31-targeted-tests">3.1 Targeted tests</a></h3>
+<pre><code class="language-bash">go test ./... -run 'Recovery|ReplayHandlesTruncate'
 </code></pre>
+<p>Set <code>RECOVERY_TRACE_METRICS=1</code> to emit <code>RECOVERY_METRIC ...</code> lines in tests.</p>
+<h3 id="32-script-harness"><a class="header" href="#32-script-harness">3.2 Script harness</a></h3>
+<pre><code class="language-bash">RECOVERY_TRACE_METRICS=1 ./scripts/recovery_scenarios.sh
+</code></pre>
+<p>Outputs are saved under <code>artifacts/recovery/</code>.</p>
+<h3 id="33-cli-checks"><a class="header" href="#33-cli-checks">3.3 CLI checks</a></h3>
 <ul>
-<li>Exercises WAL replay, manifest cleanup, vlog GC, and managed transaction recovery.</li>
-<li>Set <code>RECOVERY_TRACE_METRICS=1</code> to emit structured logs (key/value pairs) for each scenario.</li>
-</ul>
-<h3 id="32-shell-script-harness"><a class="header" href="#32-shell-script-harness">3.2 Shell Script Harness</a></h3>
-<p><code>scripts/recovery_scenarios.sh</code> orchestrates the matrix end-to-end:</p>
-<ol>
-<li>Spins up a temporary database, injects writes, and crashes at chosen checkpoints.</li>
-<li>Reopens the database and validates via CLI (<code>nokv stats</code>, <code>nokv manifest</code>, <code>nokv vlog</code>).</li>
-<li>Archives logs under <code>artifacts/recovery/&lt;scenario&gt;.log</code> for CI inspection.</li>
-</ol>
-<h3 id="33-cli-validation"><a class="header" href="#33-cli-validation">3.3 CLI Validation</a></h3>
-<ul>
-<li><code>nokv manifest --workdir &lt;dir&gt;</code>: confirm WAL checkpoint, level files, vlog head.</li>
-<li><code>nokv stats --workdir &lt;dir&gt;</code>: observe flush backlog drop to zero after replay.</li>
-<li><code>nokv vlog --workdir &lt;dir&gt;</code>: ensure stale segments disappear after GC recovery.</li>
-</ul>
-<p>These commands give the same insight as RocksDB’s <code>ldb manifest_dump</code> or Badger’s CLI but with JSON output for automation.</p>
-<hr>
-<h2 id="4-metrics-emitted-during-recovery"><a class="header" href="#4-metrics-emitted-during-recovery">4. Metrics Emitted During Recovery</a></h2>
-<p>When <code>RECOVERY_TRACE_METRICS=1</code>:</p>
-<ul>
-<li><code>RECOVERY_METRIC phase="manifest" ...</code> – manifest replay progress.</li>
-<li><code>RECOVERY_METRIC phase="wal" segment=... offset=...</code> – WAL records applied.</li>
-<li><code>RECOVERY_METRIC phase="vlog_gc" fid=... action="delete"</code> – vlog cleanup status.</li>
-</ul>
-<p><code>StatsSnapshot</code> also exposes:</p>
-<ul>
-<li><code>flush.queue_length</code> – remaining flush tasks.</li>
-<li><code>value_log.heads</code> – current value log heads after recovery.</li>
-<li><code>txn.active</code> – should reset to zero post-recovery.</li>
+<li><code>nokv manifest --workdir &lt;dir&gt;</code>: verify level files, WAL pointer, vlog metadata.</li>
+<li><code>nokv stats --workdir &lt;dir&gt;</code>: confirm flush backlog converges.</li>
+<li><code>nokv vlog --workdir &lt;dir&gt;</code>: inspect vlog segment state.</li>
 </ul>
 <hr>
-<h2 id="5-comparison-with-rocksdb--badger"><a class="header" href="#5-comparison-with-rocksdb--badger">5. Comparison with RocksDB &amp; Badger</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Aspect</th><th>RocksDB</th><th>BadgerDB</th><th>NoKV</th></tr>
-</thead>
-<tbody>
-<tr><td>WAL replay</td><td><code>DBImpl::RecoverLogFiles</code> replays per log number</td><td>Journal (value log) is replayed into LSM</td><td>Dedicated WAL manager with manifest checkpoint, plus vlog trim</td></tr>
-<tr><td>Manifest reconciliation</td><td>Removes missing files, handles CURRENT rewrite</td><td>Minimal manifest (mainly tables)</td><td>Tracks SST + vlog metadata; auto-cleans missing SST/vlog</td></tr>
-<tr><td>Value log recovery</td><td>Optional (BlobDB) requires external blob manifest</td><td>Primary log, re-scanned on start</td><td>Manifest-backed head + discard stats to avoid rescan</td></tr>
-<tr><td>Tooling</td><td><code>ldb</code> for manifest dump</td><td><code>badger</code> CLI</td><td><code>nokv</code> CLI with JSON output</td></tr>
-</tbody>
-</table>
-</div>
-<p>NoKV inherits RocksDB’s strict manifest semantics and Badger’s value log durability, yielding deterministic restart behaviour even under mixed workloads.</p>
-<hr>
-<h2 id="6-extending-the-matrix"><a class="header" href="#6-extending-the-matrix">6. Extending the Matrix</a></h2>
-<p>Future enhancements to cover:</p>
+<h2 id="4-operational-signals"><a class="header" href="#4-operational-signals">4. Operational Signals</a></h2>
+<p>Watch these fields during restart:</p>
 <ul>
-<li><strong>Compaction crash</strong> – simulate partial compaction output and verify manifest rollback.</li>
-<li><strong>Prefetch queue state</strong> – ensure hot-key prefetch map resets cleanly.</li>
-<li><strong>Raft integration</strong> – once replication is added, validate raft log catch-up interacts correctly with WAL replay.</li>
+<li><code>flush.queue_length</code></li>
+<li><code>wal.segment_count</code></li>
+<li><code>value_log.heads</code></li>
+<li><code>value_log.files</code></li>
 </ul>
-<p>Contributions adding new recovery scenarios should update this document and the shell harness to keep observability aligned.</p>
+<p>If <code>flush.queue_length</code> remains high after replay, inspect flush worker throughput and manifest sync settings.</p>
+<hr>
+<h2 id="5-notes-on-consistency-model"><a class="header" href="#5-notes-on-consistency-model">5. Notes on Consistency Model</a></h2>
+<ul>
+<li>WAL + manifest remain the authoritative recovery chain for LSM state.</li>
+<li>ValueLog is reconciled/validated but is not replayed as a mutation source.</li>
+<li>In strict flush mode (<code>ManifestSync=true</code>), SST install ordering is <code>SST Sync -&gt; RenameNoReplace -&gt; SyncDir -&gt; manifest edit</code>.</li>
+</ul>
+<p>For deeper internals, see <a href="#memtable-flush-pipeline">flush.md</a>, <a href="#manifest--version-management">manifest.md</a>, and <a href="#wal-subsystem">wal.md</a>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="stats--observability-pipeline"><a class="header" href="#stats--observability-pipeline">Stats &amp; Observability Pipeline</a></h1>
 <p>NoKV exposes runtime health through:</p>
@@ -2549,7 +2721,6 @@ heuristics; a higher-level controller could call the same APIs.</li>
         LSM["lsm.* metrics"]
         WAL["wal metrics"]
         VLOG["value log metrics"]
-        TXN["oracle txn metrics"]
         HOT["hotring"]
         REGION["region metrics"]
         TRANSPORT["grpc transport metrics"]
@@ -2558,7 +2729,6 @@ heuristics; a higher-level controller could call the same APIs.</li>
     LSM --&gt; SNAP["Stats.Snapshot()"]
     WAL --&gt; SNAP
     VLOG --&gt; SNAP
-    TXN --&gt; SNAP
     HOT --&gt; SNAP
     REGION --&gt; SNAP
     TRANSPORT --&gt; SNAP
@@ -2583,7 +2753,6 @@ heuristics; a higher-level controller could call the same APIs.</li>
 <li><code>wal.*</code></li>
 <li><code>raft.*</code></li>
 <li><code>write.*</code></li>
-<li><code>txn.*</code></li>
 <li><code>region.*</code></li>
 <li><code>hot.*</code></li>
 <li><code>cache.*</code></li>
@@ -2599,7 +2768,6 @@ heuristics; a higher-level controller could call the same APIs.</li>
 <li><code>wal.active_segment</code>, <code>wal.segment_count</code>, <code>wal.typed_record_ratio</code></li>
 <li><code>raft.group_count</code>, <code>raft.lagging_groups</code>, <code>raft.max_lag_segments</code></li>
 <li><code>write.queue_depth</code>, <code>write.avg_request_wait_ms</code>, <code>write.hot_key_limited</code></li>
-<li><code>txn.active</code>, <code>txn.started</code>, <code>txn.conflicts</code></li>
 <li><code>region.total</code>, <code>region.running</code>, <code>region.removing</code>, <code>region.tombstone</code></li>
 <li><code>hot.read_keys</code>, <code>hot.write_keys</code>, <code>hot.read_ring</code>, <code>hot.write_ring</code></li>
 <li><code>cache.block_l0_hit_rate</code>, <code>cache.bloom_hit_rate</code>, <code>cache.iterator_reused</code></li>
@@ -2611,7 +2779,7 @@ heuristics; a higher-level controller could call the same APIs.</li>
 <ul>
 <li><code>NoKV.Stats</code></li>
 </ul>
-<p>All domains (<code>flush</code>, <code>compaction</code>, <code>value_log</code>, <code>wal</code>, <code>txn</code>, <code>region</code>, <code>hot</code>, <code>cache</code>, <code>lsm</code>, <code>transport</code>, <code>redis</code>) are nested under this object.</p>
+<p>All domains (<code>flush</code>, <code>compaction</code>, <code>value_log</code>, <code>wal</code>, <code>raft</code>, <code>write</code>, <code>region</code>, <code>hot</code>, <code>cache</code>, <code>lsm</code>, <code>transport</code>, <code>redis</code>) are nested under this object.</p>
 <p>Legacy scalar compatibility keys are removed. Consumers should read fields from <code>NoKV.Stats</code> directly.</p>
 <hr>
 <h2 id="4-cli--json"><a class="header" href="#4-cli--json">4. CLI &amp; JSON</a></h2>
@@ -2677,8 +2845,8 @@ at least one group exceeds lag threshold.</li>
 <pre><code class="language-bash"># All unit + integration tests (uses local module caches)
 GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./...
 
-# Focused transaction suite
-go test ./... -run '^TestTxn|TestConflict|TestTxnIterator'
+# Focused distributed transaction suite
+go test ./percolator/... ./raftstore/client/... -run 'Test.*(Commit|Prewrite|TwoPhaseCommit)'
 
 # Crash recovery scenarios
 RECOVERY_TRACE_METRICS=1 ./scripts/recovery_scenarios.sh
@@ -2686,14 +2854,14 @@ RECOVERY_TRACE_METRICS=1 ./scripts/recovery_scenarios.sh
 # gRPC transport chaos tests + watchdog metrics
 CHAOS_TRACE_METRICS=1 ./scripts/transport_chaos.sh
 
-# Sample timestamp allocator (TSO) for multi-client transaction tests
-go run ./scripts/tso --addr 127.0.0.1:9494 --start 100
+# Sample PD-lite service for shared TSO / routing in distributed tests
+go run ./cmd/nokv pd --addr 127.0.0.1:2379 --id-start 1 --ts-start 100 --workdir ./artifacts/pd
 
-# Local three-node cluster (includes manifest bootstrap + optional TSO)
+# Local three-node cluster (includes manifest bootstrap + PD-lite)
 ./scripts/run_local_cluster.sh --config ./raft_config.example.json
 # Tear down with Ctrl+C
 
-# Docker-compose sandbox (3 nodes + TSO)
+# Docker-compose sandbox (3 nodes + PD-lite)
 docker compose up --build
 docker compose down -v
 
@@ -2726,11 +2894,11 @@ NOKV_RUN_BENCHMARKS=1 YCSB_RECORDS=10000 YCSB_OPS=50000 YCSB_WARM_OPS=0 \
 <tr><td>WAL</td><td><code>wal/manager_test.go</code></td><td>Segment rotation, sync semantics, replay tolerance for truncation, directory bootstrap.</td><td>Add IO fault injection, concurrent append stress.</td></tr>
 <tr><td>LSM / Flush / Compaction</td><td><code>lsm/lsm_test.go</code>, <code>lsm/compaction_test.go</code>, <code>lsm/compact/*_test.go</code>, <code>lsm/flush/manager_test.go</code></td><td>Memtable correctness, iterator merging, flush pipeline metrics, compaction scheduling.</td><td>Extend backpressure assertions, test cache hot/cold split.</td></tr>
 <tr><td>Manifest</td><td><code>manifest/manager_test.go</code>, <code>lsm/manifest_test.go</code></td><td>CURRENT swap safety, rewrite crash handling, vlog metadata persistence.</td><td>Simulate partial edit corruption, column family extensions.</td></tr>
-<tr><td>ValueLog</td><td><code>vlog/manager_test.go</code>, <code>vlog/io_test.go</code>, <code>vlog_test.go</code></td><td>ValuePtr encoding/decoding, GC rewrite/rewind, concurrent iterator safety.</td><td>Long-running GC with transactions, discard-ratio edge cases.</td></tr>
-<tr><td>Transactions / Oracle</td><td><code>txn_test.go</code>, <code>txn_iterator_test.go</code>, <code>stats_test.go</code></td><td>MVCC timestamps, conflict detection, iterator snapshots, metrics accounting.</td><td>Mixed workload fuzzing, managed transactions with TTL.</td></tr>
-<tr><td>DB Integration</td><td><code>db_test.go</code>, <code>db_write_bench_test.go</code></td><td>End-to-end writes, recovery, managed vs. unmanaged transactions, throttle behaviour.</td><td>Combine ValueLog GC + compaction stress, multi-DB interference.</td></tr>
+<tr><td>ValueLog</td><td><code>vlog/manager_test.go</code>, <code>vlog/io_test.go</code>, <code>vlog_test.go</code></td><td>ValuePtr encoding/decoding, GC rewrite/rewind, concurrent iterator safety.</td><td>Long-running GC, discard-ratio edge cases.</td></tr>
+<tr><td>Percolator / Distributed Txn</td><td><code>percolator/*_test.go</code>, <code>raftstore/client/client_test.go</code>, <code>stats_test.go</code></td><td>Prewrite/Commit/ResolveLock flows, 2PC retries, timestamp-driven MVCC behaviour, metrics accounting.</td><td>Mixed multi-region fuzzing with lock TTL and leader churn.</td></tr>
+<tr><td>DB Integration</td><td><code>db_test.go</code>, <code>db_write_bench_test.go</code></td><td>End-to-end writes, recovery, and throttle behaviour.</td><td>Combine ValueLog GC + compaction stress, multi-DB interference.</td></tr>
 <tr><td>CLI &amp; Stats</td><td><code>cmd/nokv/main_test.go</code>, <code>stats_test.go</code></td><td>Golden JSON output, stats snapshot correctness, hot key ranking.</td><td>CLI error handling, expvar HTTP integration tests.</td></tr>
-<tr><td>Redis Gateway</td><td><code>cmd/nokv-redis/backend_embedded_test.go</code>, <code>cmd/nokv-redis/server_test.go</code>, <code>cmd/nokv-redis/backend_raft_test.go</code></td><td>Embedded backend semantics (NX/XX, TTL, counters), RESP parser, raft backend config wiring &amp; TSO discovery.</td><td>End-to-end multi-region CRUD with raft backend, TTL lock cleanup under failures.</td></tr>
+<tr><td>Redis Gateway</td><td><code>cmd/nokv-redis/backend_embedded_test.go</code>, <code>cmd/nokv-redis/server_test.go</code>, <code>cmd/nokv-redis/backend_raft_test.go</code></td><td>Embedded backend semantics (NX/XX, TTL, counters), RESP parser, raft backend config wiring, and PD-backed routing/TSO discovery.</td><td>End-to-end multi-region CRUD with raft backend, TTL lock cleanup under failures.</td></tr>
 <tr><td>Scripts &amp; Tooling</td><td><code>cmd/nokv-config/main_test.go</code>, <code>cmd/nokv/serve_test.go</code></td><td><code>nokv-config</code> JSON/simple formats, manifest logging CLI, serve bootstrap behavior.</td><td>Add direct shell-script golden tests (currently not present) and failure-path diagnostics for <code>run_local_cluster.sh</code>.</td></tr>
 <tr><td>Benchmark</td><td><code>benchmark/ycsb_test.go</code>, <code>benchmark/ycsb_runner.go</code></td><td>YCSB throughput/latency comparisons across engines (A-G) with detailed percentile + operation mix reporting.</td><td>Automate multi-node deployments and add longer-running, multi-GB stability baselines.</td></tr>
 </tbody>
@@ -2746,9 +2914,9 @@ NOKV_RUN_BENCHMARKS=1 YCSB_RECORDS=10000 YCSB_OPS=50000 YCSB_WARM_OPS=0 \
 <tbody>
 <tr><td>Crash recovery</td><td><code>db_test.go</code>, <code>scripts/recovery_scenarios.sh</code></td><td>WAL replay, missing SST cleanup, vlog GC restart, manifest rewrite safety.</td></tr>
 <tr><td>WAL pointer desync</td><td><code>raftstore/engine/wal_storage_test.go::TestWALStorageDetectsTruncatedSegment</code></td><td>Detects manifest pointer offsets beyond truncated WAL tails to avoid silent corruption.</td></tr>
-<tr><td>Transaction contention</td><td><code>TestConflict</code>, <code>TestTxnReadAfterWrite</code>, <code>TestTxnDiscard</code></td><td>Oracle watermark handling, conflict errors, managed commit path.</td></tr>
+<tr><td>Distributed transaction contention</td><td><code>raftstore/client/client_test.go::TestClientTwoPhaseCommitAndGet</code>, <code>percolator/*_test.go</code></td><td>Lock conflicts, retries, and 2PC sequencing under region routing.</td></tr>
 <tr><td>Value separation + GC</td><td><code>vlog/manager_test.go</code>, <code>db_test.go::TestRecoveryRemovesStaleValueLogSegment</code></td><td>GC correctness, manifest integration, iterator stability.</td></tr>
-<tr><td>Iterator consistency</td><td><code>txn_iterator_test.go</code>, <code>lsm/iterator_test.go</code></td><td>Snapshot visibility, merging iterators across levels and memtables.</td></tr>
+<tr><td>Iterator consistency</td><td><code>lsm/iterator_test.go</code></td><td>Snapshot visibility, merging iterators across levels and memtables.</td></tr>
 <tr><td>Throttling / backpressure</td><td><code>lsm/compaction_test.go</code>, <code>db_test.go::TestWriteThrottle</code></td><td>L0 backlog triggers, flush queue growth, metrics observation.</td></tr>
 <tr><td>Distributed TinyKv client</td><td><code>raftstore/client/client_test.go::TestClientTwoPhaseCommitAndGet</code>, <code>raftstore/transport/grpc_transport_test.go::TestGRPCTransportManualTicksDriveElection</code></td><td>Region-aware routing, NotLeader retries, manual tick-driven elections, cross-region 2PC sequencing.</td></tr>
 <tr><td>Performance regression</td><td><code>benchmark</code> package</td><td>Compare NoKV vs Badger/Pebble by default (RocksDB optional), produce human-readable reports under <code>benchmark/benchmark_results</code>.</td></tr>
@@ -2766,7 +2934,7 @@ NOKV_RUN_BENCHMARKS=1 YCSB_RECORDS=10000 YCSB_OPS=50000 YCSB_WARM_OPS=0 \
 <hr>
 <h2 id="5-extending-coverage"><a class="header" href="#5-extending-coverage">5. Extending Coverage</a></h2>
 <ol>
-<li><strong>Property-based testing</strong> – integrate <code>testing/quick</code> or third-party generators to randomise transaction sequences (Badger uses similar fuzz tests for transaction ordering).</li>
+<li><strong>Property-based testing</strong> – integrate <code>testing/quick</code> or third-party generators to randomise distributed 2PC sequences (prewrite/commit/rollback ordering).</li>
 <li><strong>Stress harness</strong> – add a Go-based stress driver to run mixed read/write workloads for hours, capturing metrics akin to RocksDB’s <code>db_stress</code> tool.</li>
 <li><strong>Distributed readiness</strong> – strengthen raftstore fault-injection and long-run tests (leader transfer, transport chaos, snapshot catch-up) with reproducible CI artifacts.</li>
 <li><strong>CLI smoke tests</strong> – simulate corrupted directories to ensure CLI emits actionable errors.</li>
@@ -2779,13 +2947,14 @@ NOKV_RUN_BENCHMARKS=1 YCSB_RECORDS=10000 YCSB_OPS=50000 YCSB_WARM_OPS=0 \
 <h2 id="cluster-helpers"><a class="header" href="#cluster-helpers">Cluster helpers</a></h2>
 <h3 id="scriptsrun_local_clustersh"><a class="header" href="#scriptsrun_local_clustersh"><code>scripts/run_local_cluster.sh</code></a></h3>
 <ul>
-<li><strong>Purpose</strong> – builds <code>nokv</code>, <code>nokv-config</code>, and <code>nokv-tso</code>, reads <code>raft_config.json</code>, seeds manifests, and starts the TinyKv nodes (plus TSO when configured). If a store directory already contains a manifest (<code>CURRENT</code>), the seeding step is skipped so previously bootstrapped data is reused.</li>
+<li><strong>Purpose</strong> – builds <code>nokv</code> and <code>nokv-config</code>, reads <code>raft_config.json</code>, seeds manifests, starts PD-lite, and starts the TinyKv nodes. If a store directory already contains a manifest (<code>CURRENT</code>), the seeding step is skipped so previously bootstrapped data is reused.</li>
 <li><strong>Usage</strong>
 <pre><code class="language-bash">./scripts/run_local_cluster.sh --config ./raft_config.example.json --workdir ./artifacts/cluster
 </code></pre>
 </li>
 </ul>
-<p><code>--config</code> defaults to the repository’s <code>raft_config.example.json</code>; <code>--workdir</code> chooses the data root (<code>./artifacts/cluster</code> by default). For every entry under <code>stores</code> the script creates <code>store-&lt;id&gt;</code>, calls <code>nokv-config manifest</code>, and, if <code>tso.listen_addr</code> is set, launches <code>nokv-tso</code>. The script runs in the foreground—press <code>Ctrl+C</code> to stop all spawned processes.</p>
+<p><code>--config</code> defaults to the repository’s <code>raft_config.example.json</code>; <code>--workdir</code> chooses the data root (<code>./artifacts/cluster</code> by default). For every entry under <code>stores</code> the script creates <code>store-&lt;id&gt;</code> and calls <code>nokv-config manifest</code>, then launches <code>nokv pd</code> and the store processes. PD state is persisted under <code>pd.work_dir</code> (or <code>&lt;workdir&gt;/pd</code> when config omits it), so region routing metadata survives restarts. By default, store processes resolve PD from config; <code>--pd-listen</code> override is only forwarded when explicitly set. The script runs in the foreground—press <code>Ctrl+C</code> to stop all spawned processes.
+When <code>--pd-listen</code> is omitted, the script reads <code>pd.addr</code> from config and falls back to <code>127.0.0.1:2379</code>.</p>
 <blockquote>
 <p>❗️ <strong>Shutdown / restart note</strong> — To avoid WAL/manifest mismatches, stop the script with <code>Ctrl+C</code> and wait for child processes to exit. If you crash the process or the host, clean the workdir (<code>rm -rf ./artifacts/cluster</code>) before starting again; otherwise the replay step may panic when it encounters truncated WAL segments.</p>
 </blockquote>
@@ -2807,7 +2976,7 @@ The script iterates over every store in the config and writes Region metadata vi
     --workdir ./artifacts/cluster/store-1 \
     --scope local   # use --scope docker inside containers
 </code></pre>
-<code>--scope</code> decides whether to use the local addresses or the container-friendly ones. The script assembles all peer mappings (excluding the local store) and execs <code>nokv serve</code>.</li>
+<code>--scope</code> decides whether to use the local addresses or the container-friendly ones. The script also resolves PD from <code>config.pd</code> unless <code>--pd-addr</code> explicitly overrides it. It assembles all peer mappings (excluding the local store) and execs <code>nokv serve</code>.</li>
 </ul>
 <hr>
 <h2 id="diagnostics--benchmarking"><a class="header" href="#diagnostics--benchmarking">Diagnostics &amp; benchmarking</a></h2>
@@ -2827,34 +2996,40 @@ The script iterates over every store in the config and writes Region metadata vi
 </div>
 <hr>
 <h2 id="other-helpers"><a class="header" href="#other-helpers">Other helpers</a></h2>
-<h3 id="scriptstso"><a class="header" href="#scriptstso"><code>scripts/tso</code></a></h3>
-<p>A small Go program (not shell) that exposes an HTTP timestamp oracle:</p>
-<pre><code class="language-bash">go run ./scripts/tso --addr 0.0.0.0:9494 --start 100
+<h3 id="cmdnokv-pd"><a class="header" href="#cmdnokv-pd"><code>cmd/nokv pd</code></a></h3>
+<p>PD-lite service used by local scripts and compose for:</p>
+<ul>
+<li>routing (<code>GetRegionByKey</code>)</li>
+<li>ID allocation (<code>AllocID</code>)</li>
+<li>timestamp allocation (<code>Tso</code>)</li>
+</ul>
+<p>Example:</p>
+<pre><code class="language-bash">go run ./cmd/nokv pd --addr 127.0.0.1:2379 --id-start 1 --ts-start 100 --workdir ./artifacts/pd
 </code></pre>
-<p><code>run_local_cluster.sh</code> and Docker Compose invoke it automatically when <code>tso.listen_addr</code> is present in the shared config.</p>
 <hr>
 <h2 id="relationship-with-nokv-config"><a class="header" href="#relationship-with-nokv-config">Relationship with <code>nokv-config</code></a></h2>
 <ul>
-<li><code>nokv-config stores</code> / <code>regions</code> / <code>tso</code> provide structured views over <code>raft_config.json</code>, making it easy for scripts and CI to query the topology.</li>
+<li><code>nokv-config stores</code> / <code>regions</code> / <code>pd</code> provide structured views over <code>raft_config.json</code>, making it easy for scripts and CI to query the topology.</li>
 <li><code>nokv-config manifest</code> writes Region metadata into manifests and replaces the historical <code>manifestctl</code> binary.</li>
-<li><code>cmd/nokv-redis</code> reads the same config; when <code>--tso-url</code> is omitted it falls back to the <code>tso</code> section.</li>
+<li><code>cmd/nokv-redis</code> reads the same config and uses <code>config.pd</code> by default in raft mode (<code>--pd-addr</code> remains an override).</li>
 <li>Go tools or custom scripts can import <code>github.com/feichai0017/NoKV/config</code> and call <code>config.LoadFile</code> / <code>Validate</code> to consume the same <code>raft_config.json</code>, avoiding divergent schemas.</li>
 </ul>
 <p>Maintaining a single <code>raft_config.json</code> keeps local scripts, Docker Compose, Redis gateway, and automated tests aligned.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="redis-gateway"><a class="header" href="#redis-gateway">Redis Gateway</a></h1>
-<p><code>cmd/nokv-redis</code> exposes NoKV through a RESP-compatible endpoint. The gateway reuses the engine’s MVCC/transaction semantics and can operate in two modes:</p>
+<p><code>cmd/nokv-redis</code> exposes NoKV through a RESP-compatible endpoint and can operate in two modes:</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Mode</th><th>Description</th><th>Key flags</th></tr>
 </thead>
 <tbody>
-<tr><td>Embedded (<code>embedded</code>)</td><td>Opens a local <code>*NoKV.DB</code> work directory. Commands (<code>SET</code>, <code>SET NX/XX</code>, <code>EX/PX/EXAT/PXAT</code>, <code>MSET</code>, <code>INCR/DECR</code>, <code>DEL</code>, <code>MGET</code>, <code>EXISTS</code>, …) run inside <code>db.Update</code> / <code>db.View</code>, providing atomic single-key updates and snapshot reads across multiple keys.</td><td><code>--workdir &lt;dir&gt;</code></td></tr>
-<tr><td>Raft (<code>raft</code>)</td><td>Routes requests through <code>raftstore/client</code> and a TinyKv cluster. Writes execute via TwoPhaseCommit; TTL metadata is stored under <code>!redis:ttl!&lt;key&gt;</code>. When <code>--tso-url</code> is omitted, the gateway consults the <code>tso</code> block in <code>raft_config.json</code> and falls back to a local oracle if the block is absent.</td><td><code>--raft-config &lt;file&gt;</code><br><code>--tso-url http://host:port</code> (optional)</td></tr>
+<tr><td>Embedded (<code>embedded</code>)</td><td>Opens a local <code>*NoKV.DB</code> work directory. Commands (<code>SET</code>, <code>SET NX/XX</code>, <code>EX/PX/EXAT/PXAT</code>, <code>MSET</code>, <code>INCR/DECR</code>, <code>DEL</code>, <code>MGET</code>, <code>EXISTS</code>, …) run through regular DB APIs (<code>Get/SetEntry/Del</code>) with backend-side synchronization for read-modify-write operations.</td><td><code>--workdir &lt;dir&gt;</code></td></tr>
+<tr><td>Raft (<code>raft</code>)</td><td>Routes requests through <code>raftstore/client</code> and a TinyKv cluster. Writes execute via TwoPhaseCommit; TTL metadata is stored under <code>!redis:ttl!&lt;key&gt;</code>. Routing and TSO allocation are provided by PD-lite over gRPC (PD is runtime route source; config regions are bootstrap metadata).</td><td><code>--raft-config &lt;file&gt;</code><br><code>--pd-addr host:port</code> (optional override; defaults to <code>config.pd</code>)</td></tr>
 </tbody>
 </table>
 </div>
+<p>When both CLI and config provide the same setting, CLI wins.</p>
 <h2 id="usage-examples"><a class="header" href="#usage-examples">Usage examples</a></h2>
 <h3 id="embedded-backend"><a class="header" href="#embedded-backend">Embedded backend</a></h3>
 <pre><code class="language-bash">go run ./cmd/nokv-redis \
@@ -2866,7 +3041,7 @@ The script iterates over every store in the config and writes Region metadata vi
 <h3 id="raft-backend"><a class="header" href="#raft-backend">Raft backend</a></h3>
 <ol>
 <li>
-<p>Start TinyKv and, if configured, the TSO using the helper script or Docker Compose. Both consume <code>raft_config.example.json</code>, initialise manifests for each store, and launch <code>nokv-tso</code> automatically when <code>tso.listen_addr</code> is present:</p>
+<p>Start TinyKv and PD-lite using the helper script or Docker Compose. Both consume <code>raft_config.example.json</code>, initialise manifests for each store, and launch <code>nokv pd</code> automatically:</p>
 <pre><code class="language-bash">./scripts/run_local_cluster.sh
 # or: docker compose up --build
 </code></pre>
@@ -2877,7 +3052,6 @@ The script iterates over every store in the config and writes Region metadata vi
   --addr 127.0.0.1:6380 \
   --raft-config raft_config.example.json
 </code></pre>
-<p>Supply <code>--tso-url</code> only when you need to override the config file; otherwise the gateway uses <code>tso.advertise_url</code> (or <code>listen_addr</code>) from the same JSON. If the block is missing, it falls back to the embedded timestamp oracle.</p>
 </li>
 </ol>
 <h2 id="supported-commands"><a class="header" href="#supported-commands">Supported commands</a></h2>
@@ -2886,13 +3060,19 @@ The script iterates over every store in the config and writes Region metadata vi
 <li>Integer operations: <code>INCR</code>, <code>DECR</code>, <code>INCRBY</code>, <code>DECRBY</code></li>
 <li>Utility: <code>PING</code>, <code>ECHO</code>, <code>QUIT</code></li>
 </ul>
-<p>In both modes write commands are atomic. The Raft backend batches multi-key updates (<code>MSET</code>, <code>DEL</code>, …) into a single TwoPhaseCommit, matching the embedded semantics. Reads use snapshot transactions locally (<code>db.View</code>) and leader reads with TTL checks remotely.</p>
+<p>In both modes write commands are atomic. The Raft backend batches multi-key updates (<code>MSET</code>, <code>DEL</code>, …) into a single TwoPhaseCommit, matching the embedded semantics. Reads use direct <code>DB.Get</code> locally and leader reads with TTL checks remotely.</p>
 <h2 id="configuration-file"><a class="header" href="#configuration-file">Configuration file</a></h2>
 <p><code>raft_config.example.json</code> is shared by <code>scripts/run_local_cluster.sh</code>, Docker Compose, and the Redis gateway. Important fields:</p>
 <ul>
 <li><code>stores</code> – store ID, gRPC address, and optional container listen/advertise addresses</li>
 <li><code>regions</code> – region ID, start/end keys (use <code>hex:&lt;bytes&gt;</code> for binary data), epoch, peer list, leader store ID</li>
 <li><code>max_retries</code> – maximum retries for region errors in the distributed client</li>
+<li><code>pd</code> – PD-lite endpoint(s) and optional persistence dirs:
+<ul>
+<li><code>addr</code> / <code>docker_addr</code> for endpoint resolution by scope</li>
+<li><code>work_dir</code> / <code>docker_work_dir</code> for PD state persistence defaults</li>
+</ul>
+</li>
 </ul>
 <p>Use <code>nokv-config</code> to inspect or validate the configuration:</p>
 <pre><code class="language-bash">nokv-config stores --config raft_config.json
