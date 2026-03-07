@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f5b0fed8.js";
+            window.path_to_searchindex_js = "searchindex-aca6c03f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-56d2c64c.js"></script>
+        <script src="toc-c17ea2b1.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -204,10 +204,10 @@
 <p><code>RenameNoReplace</code>:</p>
 <ul>
 <li>contract: fail with <code>os.ErrExist</code> when destination already exists.</li>
-<li>on Linux, uses <code>renameat2(..., RENAME_NOREPLACE)</code> when supported.</li>
-<li>fallback path (<code>renameNoReplaceFallback</code>) checks destination existence then calls <code>Rename</code>.</li>
+<li>on Linux, uses <code>renameat2(..., RENAME_NOREPLACE)</code>.</li>
+<li>on macOS, uses <code>renamex_np(..., RENAME_EXCL)</code>.</li>
+<li>when atomic no-replace rename is unsupported by platform/filesystem, returns <code>vfs.ErrRenameNoReplaceUnsupported</code> (no non-atomic fallback).</li>
 </ul>
-<p>Important: fallback is <strong>not atomic</strong> and has TOCTOU risk. Callers needing strict no-overwrite atomicity should avoid relying on fallback behavior.</p>
 <hr>
 <h2 id="3-directory-sync-helper"><a class="header" href="#3-directory-sync-helper">3. Directory Sync Helper</a></h2>
 <p><code>vfs.SyncDir(fs, dir)</code> fsyncs directory metadata to persist entry updates (create/rename/remove).</p>

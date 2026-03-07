@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f5b0fed8.js";
+            window.path_to_searchindex_js = "searchindex-aca6c03f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-56d2c64c.js"></script>
+        <script src="toc-c17ea2b1.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -191,6 +191,9 @@ go test ./percolator/... ./raftstore/client/... -run 'Test.*(Commit|Prewrite|Two
 # Crash recovery scenarios
 RECOVERY_TRACE_METRICS=1 ./scripts/recovery_scenarios.sh
 
+# Protobuf schema hygiene
+make proto-check
+
 # gRPC transport chaos tests + watchdog metrics
 CHAOS_TRACE_METRICS=1 ./scripts/transport_chaos.sh
 
@@ -258,7 +261,7 @@ NOKV_RUN_BENCHMARKS=1 YCSB_RECORDS=10000 YCSB_OPS=50000 YCSB_WARM_OPS=0 \
 <tr><td>Value separation + GC</td><td><code>vlog/manager_test.go</code>, <code>db_test.go::TestRecoveryRemovesStaleValueLogSegment</code></td><td>GC correctness, manifest integration, iterator stability.</td></tr>
 <tr><td>Iterator consistency</td><td><code>lsm/iterator_test.go</code></td><td>Snapshot visibility, merging iterators across levels and memtables.</td></tr>
 <tr><td>Throttling / backpressure</td><td><code>lsm/compaction_test.go</code>, <code>db_test.go::TestWriteThrottle</code></td><td>L0 backlog triggers, flush queue growth, metrics observation.</td></tr>
-<tr><td>Distributed TinyKv client</td><td><code>raftstore/client/client_test.go::TestClientTwoPhaseCommitAndGet</code>, <code>raftstore/transport/grpc_transport_test.go::TestGRPCTransportManualTicksDriveElection</code></td><td>Region-aware routing, NotLeader retries, manual tick-driven elections, cross-region 2PC sequencing.</td></tr>
+<tr><td>Distributed NoKV client</td><td><code>raftstore/client/client_test.go::TestClientTwoPhaseCommitAndGet</code>, <code>raftstore/transport/grpc_transport_test.go::TestGRPCTransportManualTicksDriveElection</code></td><td>Region-aware routing, NotLeader retries, manual tick-driven elections, cross-region 2PC sequencing.</td></tr>
 <tr><td>Performance regression</td><td><code>benchmark</code> package</td><td>Compare NoKV vs Badger/Pebble by default (RocksDB optional), produce human-readable reports under <code>benchmark/benchmark_results</code>.</td></tr>
 </tbody>
 </table>

@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>File - NoKV Docs</title>
+        <title>Entry - NoKV Docs</title>
 
 
         <!-- Custom HTML head -->
@@ -178,91 +178,256 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="file-abstractions"><a class="header" href="#file-abstractions">File Abstractions</a></h1>
-<p>The <code>file</code> package encapsulates direct file-system interaction for WAL, SST, and value-log files. It provides portable mmap helpers, allocation primitives, and log file wrappers.</p>
+                        <h1 id="entry-lifecycle-encoding-and-field-semantics"><a class="header" href="#entry-lifecycle-encoding-and-field-semantics">Entry Lifecycle, Encoding, and Field Semantics</a></h1>
+<p><code>kv.Entry</code> is the core record container that flows through user APIs, commit batching,
+WAL/value-log codecs, memtable indexes, SST blocks, and iterators.</p>
+<p>This document explains:</p>
+<ol>
+<li>How key/value bytes are encoded.</li>
+<li>What <code>Entry.Key</code> / <code>Entry.Value</code> mean at each stage.</li>
+<li>Which fields are authoritative vs derived.</li>
+<li>How <code>PopulateInternalMeta</code> keeps internal fields consistent.</li>
+<li>Borrowed-vs-detached ownership rules.</li>
+</ol>
 <hr>
-<h2 id="1-core-types"><a class="header" href="#1-core-types">1. Core Types</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Type</th><th>Purpose</th><th>Key Methods</th></tr>
-</thead>
-<tbody>
-<tr><td><a href="../file/file.go#L5-L16"><code>Options</code></a></td><td>Parameter bag for opening files (FID, path, size).</td><td>Used by WAL/vlog managers.</td></tr>
-<tr><td><a href="../file/mmap_linux.go#L12-L98"><code>MmapFile</code></a></td><td>Cross-platform mmap wrapper.</td><td><code>OpenMmapFile</code>, <code>AppendBuffer</code>, <code>Truncate</code>, <code>Sync</code>.</td></tr>
-<tr><td><a href="../file/vlog.go#L17-L223"><code>LogFile</code></a></td><td>Value-log specific helper built on <code>MmapFile</code>.</td><td><code>Open</code>, <code>Write</code>, <code>Read</code>, <code>DoneWriting</code>, <code>Truncate</code>, <code>Bootstrap</code>.</td></tr>
-</tbody>
-</table>
-</div>
-<p>Darwin-specific builds live alongside (<code>mmap_darwin.go</code>, <code>sstable_darwin.go</code>) ensuring the package compiles on macOS without manual tuning.</p>
-<hr>
-<h2 id="2-mmap-management"><a class="header" href="#2-mmap-management">2. Mmap Management</a></h2>
-<ul>
-<li><code>OpenMmapFile</code> opens or creates a file, optionally extending it to <code>maxSz</code>, then mmaps it. The returned <code>MmapFile</code> exposes <code>Data []byte</code> and the underlying <code>*os.File</code> handle.</li>
-<li>Writes grow the map on demand: <code>AppendBuffer</code> checks if the write would exceed the current mapping and calls <code>Truncate</code> to expand (doubling up to 1 GiB increments).</li>
-<li><code>Sync</code> flushes dirty pages (<code>mmap.Msync</code>), while <code>Delete</code> unmaps, truncates, closes, and removes the file—used when dropping SSTs or value-log segments.</li>
-</ul>
-<p>RocksDB relies on custom Env implementations for portability; NoKV keeps the logic in Go, relying on build tags for OS differences.</p>
-<hr>
-<h2 id="3-logfile-semantics"><a class="header" href="#3-logfile-semantics">3. LogFile Semantics</a></h2>
-<p><code>LogFile</code> wraps <code>MmapFile</code> to simplify value-log operations:</p>
-<pre><code class="language-go">lf := &amp;file.LogFile{}
-_ = lf.Open(&amp;file.Options{FID: 1, FileName: "00001.vlog", MaxSz: 1&lt;&lt;29})
-var buf bytes.Buffer
-payload, _ := kv.EncodeEntry(&amp;buf, entry)
-_ = lf.Write(offset, payload)
-_ = lf.DoneWriting(offset + uint32(len(payload)))
+<h2 id="1-structure-overview"><a class="header" href="#1-structure-overview">1. Structure Overview</a></h2>
+<p>Source: <a href="../kv/entry.go"><code>kv/entry.go</code></a>, <a href="../kv/key.go"><code>kv/key.go</code></a>, <a href="../kv/value.go"><code>kv/value.go</code></a></p>
+<pre><code class="language-go">type Entry struct {
+    Key       []byte
+    Value     []byte
+    ExpiresAt uint64
+    CF        ColumnFamily
+    Meta      byte
+    Version   uint64
+    Offset    uint32
+    Hlen      int
+    ValThreshold int64
+    ref int32
+}
 </code></pre>
+<p>Important interpretation:</p>
 <ul>
-<li><code>Open</code> mmaps the file and records current size (guarded to <code>&lt; 4 GiB</code>).</li>
-<li><code>Read</code> validates offsets against both the mmap length and tracked size, preventing partial reads when GC or drop operations shrink the file.</li>
-<li>Entry encoding uses shared helpers in <code>kv</code> (<code>kv.EncodeEntry</code> / <code>kv.EncodeEntryTo</code>); <code>LogFile</code> focuses on write/read/truncate + durability semantics.</li>
-<li><code>DoneWriting</code> guarantees durability for both data bytes <code>[0, offset)</code> and the file metadata (size).
+<li><code>Key</code> is the canonical source of truth for internal records.</li>
+<li><code>CF</code> and <code>Version</code> are cached/derived fields for convenience.</li>
+<li><code>Value</code> can represent either:
 <ul>
-<li>Sequence: It flushes dirty pages (<code>msync</code>), truncates the file to <code>offset</code>, and performs a file-descriptor level sync (<code>fsync</code>) to ensure the new file size is persisted on disk before returning.</li>
-<li>Contract: Success implies that after a crash, the file size will not exceed <code>offset</code>, and all data prior to <code>offset</code> is safe.</li>
-<li>After syncing, it reinitializes the mmap and keeps the file open in read-write mode for potential subsequent appends (if logic allows) or prepares it for read-only consumption.</li>
+<li>inline value bytes, or</li>
+<li>encoded <code>ValuePtr</code> bytes (<code>Meta</code> has <code>BitValuePointer</code>).</li>
 </ul>
 </li>
-<li><code>Rewind</code> (via <code>vlog.Manager.Rewind</code>) leverages <code>LogFile.Truncate</code> and <code>Init</code> to roll back partial batches after errors.</li>
 </ul>
 <hr>
-<h2 id="4-sst-helpers"><a class="header" href="#4-sst-helpers">4. SST Helpers</a></h2>
-<p>While SSTable builders/readers live under <code>lsm/table.go</code>, they rely on <code>file</code> helpers to map index/data blocks efficiently. The build tags (<code>sstable_linux.go</code>, <code>sstable_darwin.go</code>) provide OS-specific tuning for direct I/O hints or mmap flags.</p>
+<h2 id="2-encoding-layers"><a class="header" href="#2-encoding-layers">2. Encoding Layers</a></h2>
+<h3 id="21-internal-key-encoding"><a class="header" href="#21-internal-key-encoding">2.1 Internal Key Encoding</a></h3>
+<p>Source: <a href="../kv/key.go"><code>kv/key.go</code></a></p>
+<p><code>InternalKey(cf, userKey, ts)</code> layout:</p>
+<ul>
+<li>4-byte CF header: <code>0xFF 'C' 'F' &lt;cf-byte&gt;</code></li>
+<li>raw user key bytes</li>
+<li>8-byte big-endian descending timestamp (<code>MaxUint64 - ts</code>)</li>
+</ul>
+<p>Helpers:</p>
+<ul>
+<li><code>SplitInternalKey(internal) -&gt; (cf, userKey, ts, ok)</code></li>
+<li><code>Timestamp(key)</code> / <code>StripTimestamp(key)</code> / <code>SameKey(a, b)</code></li>
+</ul>
+<h3 id="22-valuestruct-encoding"><a class="header" href="#22-valuestruct-encoding">2.2 ValueStruct Encoding</a></h3>
+<p>Source: <a href="../kv/value.go"><code>kv/value.go</code></a></p>
+<p><code>ValueStruct</code> layout:</p>
+<ul>
+<li><code>Meta</code> (1B)</li>
+<li><code>ExpiresAt</code> (uvarint)</li>
+<li><code>Value</code> (raw bytes)</li>
+</ul>
+<p><code>ValueStruct</code> does not store <code>Version</code>; version is always taken from internal key.</p>
+<h3 id="23-entry-record-encoding-wal--vlog-record-payload"><a class="header" href="#23-entry-record-encoding-wal--vlog-record-payload">2.3 Entry Record Encoding (WAL / Vlog record payload)</a></h3>
+<p>Source: <a href="../kv/entry_codec.go"><code>kv/entry_codec.go</code></a></p>
+<p>Entry codec layout:</p>
+<ul>
+<li>header (uvarints: keyLen/valueLen/meta/expiresAt)</li>
+<li>key bytes</li>
+<li>value bytes</li>
+<li>crc32</li>
+</ul>
+<p><code>DecodeEntryFrom</code> now calls <code>PopulateInternalMeta()</code> after key decode so internal
+records get consistent <code>CF/Version</code> immediately.</p>
 <hr>
-<h2 id="5-comparison"><a class="header" href="#5-comparison">5. Comparison</a></h2>
+<h2 id="3-stage-by-stage-meaning-of-key-and-value"><a class="header" href="#3-stage-by-stage-meaning-of-key-and-value">3. Stage-by-Stage Meaning of <code>Key</code> and <code>Value</code></a></h2>
+<h3 id="31-user-write-dbset-dbsetwithttl-dbapplyinternalentries"><a class="header" href="#31-user-write-dbset-dbsetwithttl-dbapplyinternalentries">3.1 User write (<code>DB.Set</code>, <code>DB.SetWithTTL</code>, <code>DB.ApplyInternalEntries</code>)</a></h3>
+<p>Source: <a href="../db.go"><code>db.go</code></a></p>
+<ul>
+<li><code>Set</code>/<code>SetWithTTL</code> use <code>NewInternalEntry(...)</code>:
+<ul>
+<li><code>Key</code>: encoded internal key.</li>
+<li><code>Value</code>: user value bytes.</li>
+</ul>
+</li>
+<li><code>ApplyInternalEntries</code> validates internal key, then writes back parsed <code>CF/Version</code>
+from key before entering write pipeline.</li>
+</ul>
+<h3 id="32-commit-worker-vlog-then-lsm-apply"><a class="header" href="#32-commit-worker-vlog-then-lsm-apply">3.2 Commit worker: vlog then LSM apply</a></h3>
+<p>Source: <a href="../db_write.go"><code>db_write.go</code></a>, <a href="../vlog.go"><code>vlog.go</code></a></p>
+<ul>
+<li>Before <code>LSM.SetBatch</code>, large values are replaced by <code>ValuePtr.Encode()</code> bytes and
+<code>BitValuePointer</code> is set.</li>
+<li>Small values stay inline.</li>
+<li><code>Key</code> remains internal key throughout.</li>
+</ul>
+<h3 id="33-wal-replay--vlog-iteration-decode"><a class="header" href="#33-wal-replay--vlog-iteration-decode">3.3 WAL replay / vlog iteration decode</a></h3>
+<p>Source: <a href="../kv/entry_codec.go"><code>kv/entry_codec.go</code></a>, <a href="../lsm/memtable.go"><code>lsm/memtable.go</code></a></p>
+<ul>
+<li>Decoded records carry internal key bytes in <code>Key</code>.</li>
+<li><code>Value</code> is record payload bytes (inline value or pointer bytes).</li>
+<li><code>CF/Version</code> are derived from key via <code>PopulateInternalMeta</code>.</li>
+</ul>
+<h3 id="34-memtable-index-lookup"><a class="header" href="#34-memtable-index-lookup">3.4 Memtable index lookup</a></h3>
+<p>Source: <a href="../lsm/memtable.go"><code>lsm/memtable.go</code></a>, <a href="../utils/skiplist.go"><code>utils/skiplist.go</code></a>, <a href="../utils/art.go"><code>utils/art.go</code></a></p>
+<ul>
+<li><code>memIndex.Search(...)</code> returns <code>(matchedInternalKey, ValueStruct)</code>.</li>
+<li><code>memTable.Get</code> assembles pooled <code>Entry</code> from this and calls <code>PopulateInternalMeta</code>.</li>
+<li>For miss, <code>Key=nil</code> and zero value struct (sentinel, not a valid record).</li>
+</ul>
+<h3 id="35-sst--iterator-decode"><a class="header" href="#35-sst--iterator-decode">3.5 SST / iterator decode</a></h3>
+<p>Source: <a href="../lsm/builder.go"><code>lsm/builder.go</code></a>, <a href="../lsm/table.go"><code>lsm/table.go</code></a></p>
+<ul>
+<li>Block iterator reconstructs internal key + value struct.</li>
+<li>It calls <code>PopulateInternalMeta</code> before exposing item entry.</li>
+<li><code>table.Search</code> clones key/value and re-populates internal metadata.</li>
+</ul>
+<h3 id="36-internal-read-api-getinternalentry"><a class="header" href="#36-internal-read-api-getinternalentry">3.6 Internal read API (<code>GetInternalEntry</code>)</a></h3>
+<p>Source: <a href="../db.go"><code>db.go</code></a></p>
+<ul>
+<li><code>loadBorrowedEntry</code> fetches from LSM.</li>
+<li>If <code>BitValuePointer</code> is set:
+<ul>
+<li>decode pointer from <code>Value</code></li>
+<li>read real bytes from vlog</li>
+<li>replace <code>Value</code> with actual value bytes</li>
+<li>clear <code>BitValuePointer</code></li>
+</ul>
+</li>
+<li>Return entry with internal key still in <code>Key</code>, and <code>CF/Version</code> re-populated.</li>
+</ul>
+<h3 id="37-public-read-api-get-public-iterator"><a class="header" href="#37-public-read-api-get-public-iterator">3.7 Public read API (<code>Get</code>, public iterator)</a></h3>
+<p>Source: <a href="../db.go"><code>db.go</code></a>, <a href="../iterator.go"><code>iterator.go</code></a></p>
+<ul>
+<li>Public APIs convert internal key to user key for external consumers.</li>
+<li>Returned entry is detached copy (<code>DB.Get</code>) or iterator materialized object.</li>
+</ul>
+<h3 id="38-runtime-state-flow-diagram"><a class="header" href="#38-runtime-state-flow-diagram">3.8 Runtime State Flow Diagram</a></h3>
+<pre class="mermaid">flowchart TD
+  A["DB.Set/SetWithTTL/Del"] --&gt; B["kv.NewInternalEntry"]
+  B --&gt; C["DB.ApplyInternalEntries"]
+  C --&gt; D["commitWorker: vlog.write"]
+  D --&gt; E["LSM/WAL persist"]
+  E --&gt; F["DB.GetInternalEntry"]
+  F --&gt; G{"BitValuePointer?"}
+  G -- yes --&gt; H["vlog.read + clear pointer bit"]
+  G -- no --&gt; I["inline value"]
+  H --&gt; J["PopulateInternalMeta"]
+  I --&gt; J
+  J --&gt; K["DB.Get cloneEntry -&gt; user key/value"]
+  J --&gt; L["DB.NewIterator materialize -&gt; user key/value"]
+</pre>
+
+<hr>
+<h2 id="4-field-validity-matrix"><a class="header" href="#4-field-validity-matrix">4. Field Validity Matrix</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Engine</th><th>Approach</th></tr>
+<tr><th>Context</th><th><code>Key</code></th><th><code>Value</code></th><th><code>CF/Version</code></th><th>Ownership</th></tr>
 </thead>
 <tbody>
-<tr><td>RocksDB</td><td>C++ Env &amp; random-access file wrappers.</td></tr>
-<tr><td>Badger</td><td><code>y.File</code> abstraction with mmap.</td></tr>
-<tr><td>NoKV</td><td>Go-native mmap wrappers with explicit log helpers.</td></tr>
+<tr><td>Internal write path</td><td>Internal key</td><td>Inline value or ptr-bytes (large values)</td><td>Valid (set at build/validate time)</td><td>Borrowed/pooled</td></tr>
+<tr><td>Decoded WAL/vlog record</td><td>Internal key</td><td>Encoded record payload value bytes</td><td>Valid after <code>PopulateInternalMeta</code></td><td>Borrowed/pooled</td></tr>
+<tr><td><code>GetInternalEntry</code> return</td><td>Internal key</td><td>Real value bytes (pointer resolved)</td><td>Valid (re-populated before return)</td><td>Borrowed/pooled</td></tr>
+<tr><td><code>DB.Get</code> return</td><td>User key</td><td>Real value bytes</td><td>Valid for external semantics</td><td>Detached copy</td></tr>
+<tr><td>Memtable miss sentinel</td><td><code>nil</code></td><td><code>nil</code></td><td><code>CFDefault/0</code></td><td>Borrowed/pooled sentinel</td></tr>
 </tbody>
 </table>
 </div>
-<p>By keeping all filesystem primitives in one package, NoKV ensures WAL, vlog, and SST layers share consistent behaviour (sync semantics, truncation rules) and simplifies testing (<code>file/mmap_linux_test.go</code>).</p>
-<hr>
-<h2 id="6-operational-notes"><a class="header" href="#6-operational-notes">6. Operational Notes</a></h2>
+<p>Rule of thumb:</p>
 <ul>
-<li><code>DoneWriting</code> provides strong crash-consistency guarantees. Even on filesystems where <code>ftruncate</code> metadata persistence is asynchronous, the explicit post-truncate <code>fsync</code> ensures the file size is durable upon success.</li>
-<li>Value-log and WAL segments rely on <code>DoneWriting</code>/<code>Truncate</code> to seal files; avoid manipulating files externally or mmap metadata may desynchronise.</li>
-<li><code>LogFile</code> updates cached size internally on <code>Write</code>/<code>Truncate</code>, so read bounds stay consistent during rewrite/rewind flows.</li>
-<li><code>vfs.SyncDir</code> is used by strict durability flows to persist directory entry changes (create/rename/remove). For example, strict SST flush calls <code>SyncDir(workdir)</code> before manifest publication.</li>
+<li>Internal code should treat <code>Key</code> as authoritative.</li>
+<li><code>CF/Version</code> should be expected to match <code>SplitInternalKey(Key)</code> after
+<code>PopulateInternalMeta</code>.</li>
 </ul>
-<p>For more on how these primitives plug into higher layers, see <a href="wal.html"><code>docs/wal.md</code></a> and <a href="vlog.html"><code>docs/vlog.md</code></a>.</p>
+<hr>
+<h2 id="5-populateinternalmeta-semantics"><a class="header" href="#5-populateinternalmeta-semantics">5. <code>PopulateInternalMeta</code> Semantics</a></h2>
+<p>Source: <a href="../kv/entry.go"><code>kv/entry.go</code></a></p>
+<pre><code class="language-go">func (e *Entry) PopulateInternalMeta() bool
+</code></pre>
+<p>Behavior:</p>
+<ol>
+<li>Parse <code>e.Key</code> as internal key.</li>
+<li>If parse succeeds:
+<ul>
+<li><code>e.CF = parsedCF</code></li>
+<li><code>e.Version = parsedTS</code></li>
+<li>return <code>true</code></li>
+</ul>
+</li>
+<li>If parse fails:
+<ul>
+<li>reset cache fields to safe defaults (<code>CFDefault</code>, <code>Version=0</code>)</li>
+<li>return <code>false</code></li>
+</ul>
+</li>
+</ol>
+<p>Why it exists:</p>
+<ul>
+<li>pooled entries can carry stale cached fields if not reset carefully;</li>
+<li>parse-once helper gives a single normalization point at codec/index/read boundaries;</li>
+<li>keeps key-derived metadata (<code>CF/Version</code>) authoritative and consistent.</li>
+</ul>
+<hr>
+<h2 id="6-ownership-and-refcount-states"><a class="header" href="#6-ownership-and-refcount-states">6. Ownership and Refcount States</a></h2>
+<p>Source: <a href="../kv/entry.go"><code>kv/entry.go</code></a>, <a href="architecture.html"><code>docs/architecture.md</code></a></p>
+<h3 id="borrowed-entry-internal"><a class="header" href="#borrowed-entry-internal">Borrowed entry (internal)</a></h3>
+<p>Returned by:</p>
+<ul>
+<li><code>DecodeEntryFrom</code></li>
+<li><code>memTable.Get</code></li>
+<li><code>LSM.Get</code> internals</li>
+<li><code>DB.GetInternalEntry</code></li>
+</ul>
+<p>Contract:</p>
+<ul>
+<li>caller must call <code>DecrRef()</code> exactly once.</li>
+<li>double release panics (underflow guard).</li>
+</ul>
+<h3 id="detached-entry-public"><a class="header" href="#detached-entry-public">Detached entry (public)</a></h3>
+<p>Returned by:</p>
+<ul>
+<li><code>DB.Get</code> (via clone)</li>
+</ul>
+<p>Contract:</p>
+<ul>
+<li>do <strong>not</strong> call <code>DecrRef()</code>.</li>
+</ul>
+<hr>
+<h2 id="7-contributor-rules"><a class="header" href="#7-contributor-rules">7. Contributor Rules</a></h2>
+<ol>
+<li>Any new internal decode boundary should either:
+<ul>
+<li>call <code>PopulateInternalMeta</code>, or</li>
+<li>immediately parse key with <code>SplitInternalKey</code> and set fields consistently.</li>
+</ul>
+</li>
+<li>Do not reintroduce value-side version caches.</li>
+<li>Keep internal APIs internal-key-first; only external APIs should expose user keys.</li>
+<li>Preserve borrowed/detached ownership contracts in comments and tests.</li>
+</ol>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="vfs.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="errors.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="cache.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="config.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -272,11 +437,11 @@ _ = lf.DoneWriting(offset + uint32(len(payload)))
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="vfs.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="errors.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="cache.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="config.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

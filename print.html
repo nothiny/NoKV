@@ -37,10 +37,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f5b0fed8.js";
+            window.path_to_searchindex_js = "searchindex-aca6c03f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-56d2c64c.js"></script>
+        <script src="toc-c17ea2b1.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -399,7 +399,13 @@ func main() {
 }
 </code></pre>
 <blockquote>
-<p>Note: <code>DB.Get</code> returns detached entries (do not call <code>DecrRef</code>). <code>DB.GetInternalEntry</code> returns borrowed entries and callers must call <code>DecrRef</code> exactly once.</p>
+<p>Note:</p>
+<ul>
+<li><code>DB.Get</code> returns detached entries (do not call <code>DecrRef</code>).</li>
+<li><code>DB.GetInternalEntry</code> returns borrowed entries and callers must call <code>DecrRef</code> exactly once.</li>
+<li><code>DB.SetWithTTL</code> accepts <code>time.Duration</code> (relative TTL). <code>DB.Set</code>/<code>DB.SetWithTTL</code> reject <code>nil</code> values; use <code>DB.Del</code> for deletes.</li>
+<li><code>DB.NewIterator</code> exposes user-facing entries, while <code>DB.NewInternalIterator</code> scans raw internal keys (<code>cf+user_key+ts</code>).</li>
+</ul>
 </blockquote>
 <h2 id="benchmarks"><a class="header" href="#benchmarks">Benchmarks</a></h2>
 <p>Micro benchmarks:</p>
@@ -440,10 +446,10 @@ func main() {
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="nokv-architecture-overview"><a class="header" href="#nokv-architecture-overview">NoKV Architecture Overview</a></h1>
-<p>NoKV delivers a hybrid storage engine that can operate as a standalone embedded KV store or as a TinyKv-compatible distributed service. This document captures the key building blocks, how they interact, and the execution flow from client to disk.</p>
+<p>NoKV delivers a hybrid storage engine that can operate as a standalone embedded KV store or as a distributed NoKV service. The distributed RPC surface follows a TinyKV/TiKV-style region + MVCC design, but the service identity and deployment model are NoKV’s own. This document captures the key building blocks, how they interact, and the execution flow from client to disk.</p>
 <hr>
 <h2 id="1-high-level-layout"><a class="header" href="#1-high-level-layout">1. High-Level Layout</a></h2>
-<pre><code>┌─────────────────────────┐   TinyKv gRPC   ┌─────────────────────────┐
+<pre><code>┌─────────────────────────┐   NoKV gRPC   ┌─────────────────────────┐
 │ raftstore Service       │◀──────────────▶ │ raftstore/client        │
 └───────────┬─────────────┘                 │  (Get / Scan / Mutate)  │
             │                               └─────────────────────────┘
@@ -475,10 +481,14 @@ func main() {
 </code></pre>
 <ul>
 <li><strong>Embedded mode</strong> uses <code>NoKV.Open</code> directly: WAL→MemTable→SST durability, ValueLog separation, MVCC semantics, rich stats.</li>
-<li><strong>Distributed mode</strong> layers <code>raftstore</code> on top: multi-Raft regions reuse the same WAL/Manifest, expose metrics, and serve TinyKv RPCs.</li>
+<li><strong>Distributed mode</strong> layers <code>raftstore</code> on top: multi-Raft regions reuse the same WAL/Manifest, expose metrics, and serve NoKV RPCs.</li>
 <li><strong>Control plane split</strong>: <code>raft_config</code> provides bootstrap topology; PD provides runtime routing/TSO/control-plane state in cluster mode.</li>
 <li><strong>Clients</strong> obtain leader-aware routing, automatic NotLeader/EpochNotMatch retries, and two-phase commit helpers.</li>
 </ul>
+<h3 id="detailed-runtime-paths"><a class="header" href="#detailed-runtime-paths">Detailed Runtime Paths</a></h3>
+<p>For function-level call chains with sequence diagrams (embedded write/read,
+iterator scan, distributed read/write via Raft apply), see
+<a href="#runtime-call-chains-current"><code>docs/runtime.md</code></a>.</p>
 <hr>
 <h2 id="2-embedded-engine"><a class="header" href="#2-embedded-engine">2. Embedded Engine</a></h2>
 <h3 id="21-wal--memtable"><a class="header" href="#21-wal--memtable">2.1 WAL &amp; MemTable</a></h3>
@@ -558,15 +568,15 @@ func main() {
 <tr><td><a href="../raftstore/store"><code>store</code></a></td><td>Region catalog, router, RegionMetrics, Region hooks, manifest integration, helpers such as <code>StartPeer</code> / <code>SplitRegion</code>.</td></tr>
 <tr><td><a href="../raftstore/peer"><code>peer</code></a></td><td>Wraps etcd/raft <code>RawNode</code>, handles Ready pipeline, snapshot resend queue, backlog instrumentation.</td></tr>
 <tr><td><a href="../raftstore/engine"><code>engine</code></a></td><td>WALStorage/DiskStorage/MemoryStorage, reusing the DB’s WAL while keeping manifest metadata in sync.</td></tr>
-<tr><td><a href="../raftstore/transport"><code>transport</code></a></td><td>gRPC transport for Raft Step messages, connection management, retries/blocks/TLS. Also acts as the host for TinyKv RPC.</td></tr>
-<tr><td><a href="../raftstore/kv"><code>kv</code></a></td><td>TinyKv RPC handler plus <code>kv.Apply</code> bridging Raft commands to MVCC logic.</td></tr>
-<tr><td><a href="../raftstore/server"><code>server</code></a></td><td><code>ServerConfig</code> + <code>New</code> combine DB, Store, transport, and TinyKv service into a reusable node instance.</td></tr>
+<tr><td><a href="../raftstore/transport"><code>transport</code></a></td><td>gRPC transport for Raft Step messages, connection management, retries/blocks/TLS. Also acts as the host for NoKV RPC.</td></tr>
+<tr><td><a href="../raftstore/kv"><code>kv</code></a></td><td>NoKV RPC handler plus <code>kv.Apply</code> bridging Raft commands to MVCC logic.</td></tr>
+<tr><td><a href="../raftstore/server"><code>server</code></a></td><td><code>ServerConfig</code> + <code>New</code> combine DB, Store, transport, and NoKV service into a reusable node instance.</td></tr>
 </tbody>
 </table>
 </div>
 <h3 id="31-bootstrap-sequence"><a class="header" href="#31-bootstrap-sequence">3.1 Bootstrap Sequence</a></h3>
 <ol>
-<li><code>raftstore.NewServer</code> wires DB, store configuration (StoreID, hooks, scheduler), Raft config, and transport address. It registers TinyKv RPC on the shared gRPC server and sets <code>transport.SetHandler(store.Step)</code>.</li>
+<li><code>raftstore.NewServer</code> wires DB, store configuration (StoreID, hooks, scheduler), Raft config, and transport address. It registers NoKV RPC on the shared gRPC server and sets <code>transport.SetHandler(store.Step)</code>.</li>
 <li>CLI (<code>nokv serve</code>) or application enumerates <code>Manifest.RegionSnapshot()</code> and calls <code>Store.StartPeer</code> for every Region containing the local store:
 <ul>
 <li><code>peer.Config</code> includes Raft params, transport, <code>kv.NewEntryApplier</code>, WAL/Manifest handles, Region metadata.</li>
@@ -577,17 +587,17 @@ func main() {
 </ol>
 <h3 id="32-command-paths"><a class="header" href="#32-command-paths">3.2 Command Paths</a></h3>
 <ul>
-<li><strong>ReadCommand</strong> (<code>KvGet</code>/<code>KvScan</code>): validate Region &amp; leader, flush pending Ready, then run <code>commandApplier</code> (i.e. <code>kv.Apply</code> in read mode) to fetch data directly from the DB. This yields leader-strong reads without a Raft round trip.</li>
+<li><strong>ReadCommand</strong> (<code>KvGet</code>/<code>KvScan</code>): validate Region &amp; leader, execute Raft ReadIndex (<code>LinearizableRead</code>) and <code>WaitApplied</code>, then run <code>commandApplier</code> (i.e. <code>kv.Apply</code> in read mode) to fetch data from the DB. This yields leader-strong reads with an explicit Raft linearizability barrier.</li>
 <li><strong>ProposeCommand</strong> (write): encode the request, push through Router to the leader peer, replicate via Raft, and apply in <code>kv.Apply</code> which maps to MVCC operations.</li>
 </ul>
 <h3 id="33-transport"><a class="header" href="#33-transport">3.3 Transport</a></h3>
 <ul>
-<li>gRPC server handles Step RPCs and TinyKv RPCs on the same endpoint; peers are registered via <code>SetPeer</code>.</li>
+<li>gRPC server handles Step RPCs and NoKV RPCs on the same endpoint; peers are registered via <code>SetPeer</code>.</li>
 <li>Retry policies (<code>WithRetry</code>) and TLS credentials are configurable. Tests cover partitions, blocked peers, and slow followers.</li>
 </ul>
 <hr>
-<h2 id="4-tinykv-service"><a class="header" href="#4-tinykv-service">4. TinyKv Service</a></h2>
-<p><code>raftstore/kv/service.go</code> exposes pb.TinyKv RPCs:</p>
+<h2 id="4-nokv-service"><a class="header" href="#4-nokv-service">4. NoKV Service</a></h2>
+<p><code>raftstore/kv/service.go</code> exposes pb.NoKV RPCs:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -604,12 +614,13 @@ func main() {
 </table>
 </div>
 <p><code>nokv serve</code> is the CLI entry point—open the DB, construct <code>raftstore.Server</code>, register peers, start local Raft peers, and display a manifest summary (Regions, key ranges, peers). <code>scripts/run_local_cluster.sh</code> builds the CLI, writes a minimal region manifest, launches multiple <code>nokv serve</code> processes on localhost, and handles cleanup on Ctrl+C.</p>
+<p>The RPC request/response shape is intentionally close to TinyKV/TiKV so the MVCC and region semantics remain familiar, but the service name exposed on the wire is <code>pb.NoKV</code>.</p>
 <hr>
 <h2 id="5-client-workflow"><a class="header" href="#5-client-workflow">5. Client Workflow</a></h2>
 <p><code>raftstore/client</code> offers a leader-aware client with retry logic and convenient helpers:</p>
 <ul>
 <li><strong>Initialization</strong>: provide <code>[]StoreEndpoint</code> + <code>RegionResolver</code> (<code>GetRegionByKey</code>) so runtime routing is PD-driven.</li>
-<li><strong>Reads</strong>: <code>Get</code> and <code>Scan</code> pick the leader store for a key range, issue TinyKv RPCs, and retry on NotLeader/EpochNotMatch.</li>
+<li><strong>Reads</strong>: <code>Get</code> and <code>Scan</code> pick the leader store for a key range, issue NoKV RPCs, and retry on NotLeader/EpochNotMatch.</li>
 <li><strong>Writes</strong>: <code>Mutate</code> bundles operations per region and drives Prewrite/Commit (primary first, secondaries after); <code>Put</code> and <code>Delete</code> are convenience wrappers using the same 2PC path.</li>
 <li><strong>Timestamps</strong>: clients must supply <code>startVersion</code>/<code>commitVersion</code>. For distributed demos, use PD-lite (<code>nokv pd</code>) to obtain globally increasing values before calling <code>TwoPhaseCommit</code>.</li>
 <li><strong>Bootstrap helpers</strong>: <code>scripts/run_local_cluster.sh --config raft_config.example.json</code> builds the binaries, seeds manifests via <code>nokv-config manifest</code>, launches PD-lite, and starts the stores declared in the config.</li>
@@ -637,7 +648,7 @@ func main() {
 <li>Inspect scheduler/control-plane state via PD APIs/metrics.</li>
 <li>Scripts:
 <ul>
-<li><code>scripts/run_local_cluster.sh</code> – launch a multi-node TinyKv cluster locally.</li>
+<li><code>scripts/run_local_cluster.sh</code> – launch a multi-node NoKV cluster locally.</li>
 <li><code>scripts/recovery_scenarios.sh</code> – crash-recovery test harness.</li>
 <li><code>scripts/transport_chaos.sh</code> – inject network faults and observe transport metrics.</li>
 </ul>
@@ -647,10 +658,565 @@ func main() {
 <h2 id="8-when-to-use-nokv"><a class="header" href="#8-when-to-use-nokv">8. When to Use NoKV</a></h2>
 <ul>
 <li><strong>Embedded</strong>: call <code>NoKV.Open</code>, use the local non-transactional DB APIs.</li>
-<li><strong>Distributed</strong>: deploy <code>nokv serve</code> nodes, use <code>raftstore/client</code> (or any TinyKv gRPC client) to perform reads, scans, and 2PC writes.</li>
+<li><strong>Distributed</strong>: deploy <code>nokv serve</code> nodes, use <code>raftstore/client</code> (or any NoKV gRPC client) to perform reads, scans, and 2PC writes.</li>
 <li><strong>Observability-first</strong>: inspection via CLI or expvar is built-in; Region, WAL, Flush, and Raft metrics are accessible without extra instrumentation.</li>
 </ul>
 <p>See also <a href="#raftstore-deep-dive"><code>docs/raftstore.md</code></a> for deeper internals, <a href="#pd-lite"><code>docs/pd.md</code></a> for control-plane details, and <a href="#testing--validation-matrix"><code>docs/testing.md</code></a> for coverage details.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="runtime-call-chains-current"><a class="header" href="#runtime-call-chains-current">Runtime Call Chains (Current)</a></h1>
+<p>This document focuses on the current execution paths in NoKV and maps API calls
+to concrete functions in the codebase.</p>
+<p>It intentionally describes only what is running today.</p>
+<hr>
+<h2 id="1-api-surface-snapshot"><a class="header" href="#1-api-surface-snapshot">1. API Surface Snapshot</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Mode</th><th>Read APIs</th><th>Write APIs</th><th>Txn APIs</th></tr>
+</thead>
+<tbody>
+<tr><td>Embedded (<code>NoKV.DB</code>)</td><td><code>Get</code>, <code>NewIterator</code>, <code>NewInternalIterator</code></td><td><code>Set</code>, <code>SetWithTTL</code>, <code>Del</code>, <code>ApplyInternalEntries</code></td><td>N/A (no standalone local txn API)</td></tr>
+<tr><td>Distributed (<code>raftstore/kv</code>)</td><td><code>KvGet</code>, <code>KvBatchGet</code>, <code>KvScan</code></td><td>N/A direct write</td><td><code>KvPrewrite</code>, <code>KvCommit</code>, <code>KvBatchRollback</code>, <code>KvResolveLock</code>, <code>KvCheckTxnStatus</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Core entry points:</p>
+<ul>
+<li>Embedded DB: <a href="../db.go"><code>db.go</code></a>, <a href="../db_write.go"><code>db_write.go</code></a>, <a href="../iterator.go"><code>iterator.go</code></a></li>
+<li>Distributed RPC: <a href="../raftstore/kv/service.go"><code>raftstore/kv/service.go</code></a></li>
+<li>Raft read/propose bridge: <a href="../raftstore/store/command_service.go"><code>raftstore/store/command_service.go</code></a></li>
+<li>MVCC logic: <a href="../percolator/txn.go"><code>percolator/txn.go</code></a>, <a href="../percolator/reader.go"><code>percolator/reader.go</code></a></li>
+</ul>
+<hr>
+<h2 id="2-embedded-write-path-set--setwithttl--del"><a class="header" href="#2-embedded-write-path-set--setwithttl--del">2. Embedded Write Path (<code>Set</code> / <code>SetWithTTL</code> / <code>Del</code>)</a></h2>
+<h3 id="21-function-level-chain"><a class="header" href="#21-function-level-chain">2.1 Function-Level Chain</a></h3>
+<ol>
+<li><code>DB.Set</code> / <code>DB.SetWithTTL</code> / <code>DB.Del</code> creates internal-key entry via <code>kv.NewInternalEntry</code>.</li>
+<li><code>DB.ApplyInternalEntries</code> validates each internal key via <code>kv.SplitInternalKey</code>, then calls <code>batchSet</code>.</li>
+<li><code>batchSet</code> enqueues request (<code>sendToWriteCh</code> -&gt; commit queue).</li>
+<li><code>commitWorker</code> drains a batch:
+<ul>
+<li><code>vlog.write(requests)</code> writes large values first and produces <code>ValuePtr</code>.</li>
+<li><code>applyRequests</code> -&gt; <code>writeToLSM</code> -&gt; <code>lsm.SetBatch</code>.</li>
+</ul>
+</li>
+<li><code>lsm.SetBatch</code> writes one atomic batch:
+<ul>
+<li><code>memTable.setBatch</code></li>
+<li><code>wal.AppendEntryBatch</code></li>
+<li>mem index insert.</li>
+</ul>
+</li>
+</ol>
+<h3 id="22-sequence-diagram"><a class="header" href="#22-sequence-diagram">2.2 Sequence Diagram</a></h3>
+<pre class="mermaid">sequenceDiagram
+    participant U as User API
+    participant DB as DB.Set/SetWithTTL/Del
+    participant Q as commitQueue
+    participant W as commitWorker
+    participant V as vlog.write
+    participant L as lsm.SetBatch
+    participant M as memTable.setBatch
+    participant WAL as wal.AppendEntryBatch
+    U-&gt;&gt;DB: Set/SetWithTTL/Del
+    DB-&gt;&gt;DB: NewInternalEntry + ApplyInternalEntries
+    DB-&gt;&gt;Q: sendToWriteCh / enqueueCommitRequest
+    Q-&gt;&gt;W: nextCommitBatch
+    W-&gt;&gt;V: write(requests)
+    V--&gt;&gt;W: ValuePtr for large values
+    W-&gt;&gt;L: writeToLSM(entries)
+    L-&gt;&gt;M: setBatch(entries)
+    M-&gt;&gt;WAL: AppendEntryBatch(entries)
+    M--&gt;&gt;L: index.Add(...)
+    L--&gt;&gt;W: success
+</pre>
+
+<hr>
+<h2 id="3-embedded-read-path-get--getinternalentry"><a class="header" href="#3-embedded-read-path-get--getinternalentry">3. Embedded Read Path (<code>Get</code> / <code>GetInternalEntry</code>)</a></h2>
+<h3 id="31-function-level-chain"><a class="header" href="#31-function-level-chain">3.1 Function-Level Chain</a></h3>
+<ol>
+<li><code>DB.Get</code> builds <code>InternalKey(CFDefault, userKey, nonTxnMaxVersion)</code>.</li>
+<li><code>loadBorrowedEntry</code> calls <code>lsm.Get</code> for the newest visible internal record.</li>
+<li>If value is pointer (<code>BitValuePointer</code>), read real bytes via <code>vlog.read</code>, clear pointer bit.</li>
+<li><code>PopulateInternalMeta</code> ensures <code>CF/Version</code> cache matches internal key.</li>
+<li><code>DB.Get</code> returns detached public entry via <code>cloneEntry</code> (user key + copied value).</li>
+<li><code>DB.GetInternalEntry</code> returns borrowed internal entry (caller must <code>DecrRef</code>).</li>
+</ol>
+<h3 id="32-sequence-diagram"><a class="header" href="#32-sequence-diagram">3.2 Sequence Diagram</a></h3>
+<pre class="mermaid">sequenceDiagram
+    participant U as User API
+    participant DB as DB.Get/GetInternalEntry
+    participant LSM as lsm.Get
+    participant VLOG as vlog.read
+    U-&gt;&gt;DB: Get(userKey)
+    DB-&gt;&gt;DB: InternalKey(CFDefault,userKey,nonTxnMaxVersion)
+    DB-&gt;&gt;LSM: Get(internalKey)
+    LSM--&gt;&gt;DB: pooled Entry (internal key)
+    alt BitValuePointer set
+        DB-&gt;&gt;VLOG: read(ValuePtr)
+        VLOG--&gt;&gt;DB: raw value bytes
+    end
+    DB-&gt;&gt;DB: PopulateInternalMeta
+    alt Get (public)
+        DB-&gt;&gt;DB: cloneEntry -&gt; user key/value copy
+        DB--&gt;&gt;U: detached Entry
+    else GetInternalEntry
+        DB--&gt;&gt;U: borrowed internal Entry (DecrRef required)
+    end
+</pre>
+
+<hr>
+<h2 id="4-iterator-paths"><a class="header" href="#4-iterator-paths">4. Iterator Paths</a></h2>
+<h3 id="41-public-iterator-dbnewiterator"><a class="header" href="#41-public-iterator-dbnewiterator">4.1 Public Iterator (<code>DB.NewIterator</code>)</a></h3>
+<ol>
+<li>Build merged internal iterator: <code>lsm.NewIterators</code> + <code>lsm.NewMergeIterator</code>.</li>
+<li><code>Seek</code> converts user key to internal seek key (<code>CFDefault + nonTxnMaxVersion</code>).</li>
+<li><code>populate/materialize</code>:
+<ul>
+<li>parse internal key (<code>kv.SplitInternalKey</code>)</li>
+<li>apply bounds on user key</li>
+<li>optionally resolve vlog pointer</li>
+<li>expose user-key item.</li>
+</ul>
+</li>
+</ol>
+<h3 id="42-internal-iterator-dbnewinternaliterator"><a class="header" href="#42-internal-iterator-dbnewinternaliterator">4.2 Internal Iterator (<code>DB.NewInternalIterator</code>)</a></h3>
+<ul>
+<li>Directly returns merged iterator over internal keys.</li>
+<li>No user-key rewrite; caller handles <code>kv.SplitInternalKey</code>.</li>
+</ul>
+<pre class="mermaid">flowchart TD
+  A["DB.NewIterator"] --&gt; B["lsm.NewMergeIterator(internal keys)"]
+  B --&gt; C["Seek(userKey -&gt; InternalKey)"]
+  C --&gt; D["populate/materialize"]
+  D --&gt; E["SplitInternalKey + bounds check"]
+  E --&gt; F{"BitValuePointer?"}
+  F -- no --&gt; G["Expose inline value"]
+  F -- yes --&gt; H["vlog.read(ValuePtr)"]
+  H --&gt; G
+  G --&gt; I["Item.Entry uses user key"]
+</pre>
+
+<hr>
+<h2 id="5-distributed-read-path-kvget--kvbatchget--kvscan"><a class="header" href="#5-distributed-read-path-kvget--kvbatchget--kvscan">5. Distributed Read Path (<code>KvGet</code> / <code>KvBatchGet</code> / <code>KvScan</code>)</a></h2>
+<h3 id="51-function-level-chain"><a class="header" href="#51-function-level-chain">5.1 Function-Level Chain</a></h3>
+<ol>
+<li><code>raftstore/kv.Service</code> builds <code>RaftCmdRequest</code> from NoKV RPC.</li>
+<li><code>Store.ReadCommand</code>:
+<ul>
+<li><code>validateCommand</code> (region/epoch/leader/key-range)</li>
+<li><code>peer.LinearizableRead</code></li>
+<li><code>peer.WaitApplied</code></li>
+<li><code>commandApplier(req)</code> (injected as <code>kv.Apply</code>).</li>
+</ul>
+</li>
+<li><code>kv.Apply</code> executes:
+<ul>
+<li><code>handleGet</code> -&gt; <code>percolator.Reader.GetLock</code> + <code>GetValue</code></li>
+<li><code>handleScan</code> -&gt; iterate <code>CFWrite</code>, resolve visible versions.</li>
+</ul>
+</li>
+</ol>
+<h3 id="52-sequence-diagram"><a class="header" href="#52-sequence-diagram">5.2 Sequence Diagram</a></h3>
+<pre class="mermaid">sequenceDiagram
+    participant C as NoKV Client
+    participant SVC as kv.Service
+    participant ST as Store.ReadCommand
+    participant P as peer.LinearizableRead
+    participant AP as kv.Apply
+    participant R as percolator.Reader
+    participant DB as DB
+    C-&gt;&gt;SVC: KvGet/KvBatchGet/KvScan
+    SVC-&gt;&gt;ST: ReadCommand(RaftCmdRequest)
+    ST-&gt;&gt;ST: validateCommand
+    ST-&gt;&gt;P: LinearizableRead + WaitApplied
+    ST-&gt;&gt;AP: commandApplier(req)
+    AP-&gt;&gt;R: GetLock/GetValue or scan CFWrite
+    R-&gt;&gt;DB: GetInternalEntry/NewInternalIterator
+    AP--&gt;&gt;SVC: RaftCmdResponse
+    SVC--&gt;&gt;C: NoKV response
+</pre>
+
+<hr>
+<h2 id="6-distributed-write-path-2pc-via-raft-apply"><a class="header" href="#6-distributed-write-path-2pc-via-raft-apply">6. Distributed Write Path (2PC via Raft Apply)</a></h2>
+<h3 id="61-function-level-chain"><a class="header" href="#61-function-level-chain">6.1 Function-Level Chain</a></h3>
+<ol>
+<li>Client (<code>raftstore/client</code>) runs <code>Mutate</code> / <code>TwoPhaseCommit</code> by region.</li>
+<li>RPC layer (<code>kv.Service</code>) sends write commands through <code>Store.ProposeCommand</code>.</li>
+<li>Raft replication commits log entries; apply path invokes <code>kv.Apply</code>.</li>
+<li><code>kv.Apply</code> dispatches to <code>percolator.Prewrite/Commit/BatchRollback/ResolveLock/CheckTxnStatus</code>.</li>
+<li>Percolator mutators call <code>applyVersionedOps</code>:
+<ul>
+<li>build entries via <code>kv.NewInternalEntry</code></li>
+<li>call <code>db.ApplyInternalEntries</code></li>
+<li>release refs (<code>DecrRef</code>).</li>
+</ul>
+</li>
+<li>Storage then follows the same embedded write pipeline (vlog -&gt; LSM/WAL).</li>
+</ol>
+<h3 id="62-sequence-diagram"><a class="header" href="#62-sequence-diagram">6.2 Sequence Diagram</a></h3>
+<pre class="mermaid">sequenceDiagram
+    participant CL as raftstore/client
+    participant SVC as kv.Service
+    participant ST as Store.ProposeCommand
+    participant RF as Raft replicate/apply
+    participant AP as kv.Apply
+    participant TXN as percolator.txn
+    participant DB as DB.ApplyInternalEntries
+    CL-&gt;&gt;SVC: KvPrewrite/KvCommit/...
+    SVC-&gt;&gt;ST: ProposeCommand
+    ST-&gt;&gt;RF: route to leader + replicate
+    RF-&gt;&gt;AP: apply committed command
+    AP-&gt;&gt;TXN: Prewrite/Commit/Resolve...
+    TXN-&gt;&gt;DB: applyVersionedOps -&gt; ApplyInternalEntries
+    DB--&gt;&gt;TXN: write result
+    AP--&gt;&gt;SVC: RaftCmdResponse
+    SVC--&gt;&gt;CL: NoKV response
+</pre>
+
+<hr>
+<h2 id="7-entry-ownership-and-refcount-rules"><a class="header" href="#7-entry-ownership-and-refcount-rules">7. Entry Ownership and Refcount Rules</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Source</th><th>Returned entry type</th><th>Key form</th><th>Caller action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>DB.GetInternalEntry</code></td><td>Borrowed pooled</td><td>Internal key</td><td>Must call <code>DecrRef()</code> once</td></tr>
+<tr><td><code>DB.Get</code></td><td>Detached copy</td><td>User key</td><td>Must not call <code>DecrRef()</code></td></tr>
+<tr><td><code>percolator.applyVersionedOps</code> temporary entries</td><td>Borrowed pooled</td><td>Internal key</td><td>Always <code>DecrRef()</code> after <code>ApplyInternalEntries</code></td></tr>
+<tr><td><code>LSM.Get</code> / memtable reads</td><td>Borrowed pooled</td><td>Internal key</td><td>Upstream owner must release</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="8-keyvalue-shape-by-stage"><a class="header" href="#8-keyvalue-shape-by-stage">8. Key/Value Shape by Stage</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Stage</th><th><code>Entry.Key</code></th><th><code>Entry.Value</code></th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td>User write before queue</td><td>Internal key (<code>CF + user key + ts</code>)</td><td>Raw user bytes</td><td>Built by <code>NewInternalEntry</code></td></tr>
+<tr><td>After vlog step</td><td>Internal key</td><td>Inline value or <code>ValuePtr.Encode()</code></td><td>Pointer marked by <code>BitValuePointer</code></td></tr>
+<tr><td>LSM/WAL stored form</td><td>Internal key</td><td>Encoded value payload</td><td>Used by replay/flush/compaction</td></tr>
+<tr><td><code>GetInternalEntry</code> output</td><td>Internal key</td><td>Raw value bytes (pointer resolved)</td><td>Internal caller view</td></tr>
+<tr><td><code>Get</code> / public iterator output</td><td>User key</td><td>Raw value bytes</td><td>External caller view</td></tr>
+</tbody>
+</table>
+</div>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="error-handling-guide"><a class="header" href="#error-handling-guide">Error Handling Guide</a></h1>
+<p>This document defines how NoKV should own, define, and propagate errors.</p>
+<hr>
+<h2 id="1-ownership-rules"><a class="header" href="#1-ownership-rules">1. Ownership Rules</a></h2>
+<ol>
+<li>Domain errors stay in domain packages.</li>
+<li>Cross-cutting runtime errors may live in <code>utils</code> only when shared by multiple subsystems.</li>
+<li>Command-local/business-flow errors should be unexported (<code>errXxx</code>) and stay in command/service packages.</li>
+</ol>
+<p>Examples:</p>
+<ul>
+<li><code>kv</code>: entry codec/read-decode errors.</li>
+<li><code>vfs</code>: filesystem contract errors.</li>
+<li><code>pd/core</code>: control-plane validation/conflict errors.</li>
+</ul>
+<hr>
+<h2 id="2-propagation-rules"><a class="header" href="#2-propagation-rules">2. Propagation Rules</a></h2>
+<ol>
+<li>Wrap with <code>%w</code> when crossing package boundaries.</li>
+<li>Match via <code>errors.Is</code>, not string compare.</li>
+<li>Keep stable sentinel values for retryable / control-flow decisions.</li>
+<li>Add context in upper layers; do not lose original cause.</li>
+</ol>
+<hr>
+<h2 id="3-naming-rules"><a class="header" href="#3-naming-rules">3. Naming Rules</a></h2>
+<ol>
+<li>Exported sentinels use <code>ErrXxx</code>.</li>
+<li>Error text should be lowercase and package-scoped when useful (for example <code>pd/core: ...</code>, <code>vfs: ...</code>).</li>
+<li>Avoid duplicate sentinels with identical semantics in different packages.</li>
+</ol>
+<hr>
+<h2 id="4-current-error-map"><a class="header" href="#4-current-error-map">4. Current Error Map</a></h2>
+<h3 id="shared-runtime-sentinels"><a class="header" href="#shared-runtime-sentinels">Shared runtime sentinels</a></h3>
+<ul>
+<li><code>utils/error.go</code>: common cross-package sentinels such as invalid request,
+key/value validation errors, throttling, and lifecycle guards.</li>
+</ul>
+<h3 id="domain-specific-sentinels"><a class="header" href="#domain-specific-sentinels">Domain-specific sentinels</a></h3>
+<ul>
+<li><code>kv/entry_codec.go</code>: <code>ErrBadChecksum</code>, <code>ErrPartialEntry</code></li>
+<li><code>vfs/vfs.go</code>: <code>ErrRenameNoReplaceUnsupported</code></li>
+<li><code>lsm/compact/errors.go</code>: compaction planner/runtime domain errors</li>
+<li><code>raftstore/peer/errors.go</code>: peer lifecycle/state errors</li>
+<li><code>pb/errorpb.proto</code>: region/store routing protobuf errors (<code>RegionError</code>,
+<code>StoreNotMatch</code>, <code>RegionNotFound</code>, <code>KeyNotInRegion</code>, …)</li>
+<li><code>wal/errors.go</code>: WAL encode/decode and segment errors</li>
+<li><code>pd/core/errors.go</code>: PD metadata and range validation errors</li>
+</ul>
+<hr>
+<h2 id="5-propagation-in-hot-paths"><a class="header" href="#5-propagation-in-hot-paths">5. Propagation in Hot Paths</a></h2>
+<ol>
+<li>Embedded write path (<code>DB.Set*</code> -&gt; commit worker -&gt; LSM/WAL):
+<ul>
+<li>validation returns direct sentinel (<code>ErrEmptyKey</code>, <code>ErrNilValue</code>, <code>ErrInvalidRequest</code>);</li>
+<li>storage boundary errors are wrapped with context and preserved via <code>%w</code>.</li>
+</ul>
+</li>
+<li>Distributed command path (<code>kv.Service</code> -&gt; <code>Store.*Command</code> -&gt; <code>kv.Apply</code>):
+<ul>
+<li>region/leader/store/range failures are mapped to <code>errorpb</code> messages in protobuf responses;</li>
+<li>execution failures return Go errors to RPC layer and are translated to gRPC status.</li>
+</ul>
+</li>
+<li>Recovery/replay path (WAL/Vlog/Manifest):
+<ul>
+<li>partial/corrupt records return domain sentinels and are handled by truncation or
+restart logic in upper layers.</li>
+</ul>
+</li>
+</ol>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="entry-lifecycle-encoding-and-field-semantics"><a class="header" href="#entry-lifecycle-encoding-and-field-semantics">Entry Lifecycle, Encoding, and Field Semantics</a></h1>
+<p><code>kv.Entry</code> is the core record container that flows through user APIs, commit batching,
+WAL/value-log codecs, memtable indexes, SST blocks, and iterators.</p>
+<p>This document explains:</p>
+<ol>
+<li>How key/value bytes are encoded.</li>
+<li>What <code>Entry.Key</code> / <code>Entry.Value</code> mean at each stage.</li>
+<li>Which fields are authoritative vs derived.</li>
+<li>How <code>PopulateInternalMeta</code> keeps internal fields consistent.</li>
+<li>Borrowed-vs-detached ownership rules.</li>
+</ol>
+<hr>
+<h2 id="1-structure-overview"><a class="header" href="#1-structure-overview">1. Structure Overview</a></h2>
+<p>Source: <a href="../kv/entry.go"><code>kv/entry.go</code></a>, <a href="../kv/key.go"><code>kv/key.go</code></a>, <a href="../kv/value.go"><code>kv/value.go</code></a></p>
+<pre><code class="language-go">type Entry struct {
+    Key       []byte
+    Value     []byte
+    ExpiresAt uint64
+    CF        ColumnFamily
+    Meta      byte
+    Version   uint64
+    Offset    uint32
+    Hlen      int
+    ValThreshold int64
+    ref int32
+}
+</code></pre>
+<p>Important interpretation:</p>
+<ul>
+<li><code>Key</code> is the canonical source of truth for internal records.</li>
+<li><code>CF</code> and <code>Version</code> are cached/derived fields for convenience.</li>
+<li><code>Value</code> can represent either:
+<ul>
+<li>inline value bytes, or</li>
+<li>encoded <code>ValuePtr</code> bytes (<code>Meta</code> has <code>BitValuePointer</code>).</li>
+</ul>
+</li>
+</ul>
+<hr>
+<h2 id="2-encoding-layers"><a class="header" href="#2-encoding-layers">2. Encoding Layers</a></h2>
+<h3 id="21-internal-key-encoding"><a class="header" href="#21-internal-key-encoding">2.1 Internal Key Encoding</a></h3>
+<p>Source: <a href="../kv/key.go"><code>kv/key.go</code></a></p>
+<p><code>InternalKey(cf, userKey, ts)</code> layout:</p>
+<ul>
+<li>4-byte CF header: <code>0xFF 'C' 'F' &lt;cf-byte&gt;</code></li>
+<li>raw user key bytes</li>
+<li>8-byte big-endian descending timestamp (<code>MaxUint64 - ts</code>)</li>
+</ul>
+<p>Helpers:</p>
+<ul>
+<li><code>SplitInternalKey(internal) -&gt; (cf, userKey, ts, ok)</code></li>
+<li><code>Timestamp(key)</code> / <code>StripTimestamp(key)</code> / <code>SameKey(a, b)</code></li>
+</ul>
+<h3 id="22-valuestruct-encoding"><a class="header" href="#22-valuestruct-encoding">2.2 ValueStruct Encoding</a></h3>
+<p>Source: <a href="../kv/value.go"><code>kv/value.go</code></a></p>
+<p><code>ValueStruct</code> layout:</p>
+<ul>
+<li><code>Meta</code> (1B)</li>
+<li><code>ExpiresAt</code> (uvarint)</li>
+<li><code>Value</code> (raw bytes)</li>
+</ul>
+<p><code>ValueStruct</code> does not store <code>Version</code>; version is always taken from internal key.</p>
+<h3 id="23-entry-record-encoding-wal--vlog-record-payload"><a class="header" href="#23-entry-record-encoding-wal--vlog-record-payload">2.3 Entry Record Encoding (WAL / Vlog record payload)</a></h3>
+<p>Source: <a href="../kv/entry_codec.go"><code>kv/entry_codec.go</code></a></p>
+<p>Entry codec layout:</p>
+<ul>
+<li>header (uvarints: keyLen/valueLen/meta/expiresAt)</li>
+<li>key bytes</li>
+<li>value bytes</li>
+<li>crc32</li>
+</ul>
+<p><code>DecodeEntryFrom</code> now calls <code>PopulateInternalMeta()</code> after key decode so internal
+records get consistent <code>CF/Version</code> immediately.</p>
+<hr>
+<h2 id="3-stage-by-stage-meaning-of-key-and-value"><a class="header" href="#3-stage-by-stage-meaning-of-key-and-value">3. Stage-by-Stage Meaning of <code>Key</code> and <code>Value</code></a></h2>
+<h3 id="31-user-write-dbset-dbsetwithttl-dbapplyinternalentries"><a class="header" href="#31-user-write-dbset-dbsetwithttl-dbapplyinternalentries">3.1 User write (<code>DB.Set</code>, <code>DB.SetWithTTL</code>, <code>DB.ApplyInternalEntries</code>)</a></h3>
+<p>Source: <a href="../db.go"><code>db.go</code></a></p>
+<ul>
+<li><code>Set</code>/<code>SetWithTTL</code> use <code>NewInternalEntry(...)</code>:
+<ul>
+<li><code>Key</code>: encoded internal key.</li>
+<li><code>Value</code>: user value bytes.</li>
+</ul>
+</li>
+<li><code>ApplyInternalEntries</code> validates internal key, then writes back parsed <code>CF/Version</code>
+from key before entering write pipeline.</li>
+</ul>
+<h3 id="32-commit-worker-vlog-then-lsm-apply"><a class="header" href="#32-commit-worker-vlog-then-lsm-apply">3.2 Commit worker: vlog then LSM apply</a></h3>
+<p>Source: <a href="../db_write.go"><code>db_write.go</code></a>, <a href="../vlog.go"><code>vlog.go</code></a></p>
+<ul>
+<li>Before <code>LSM.SetBatch</code>, large values are replaced by <code>ValuePtr.Encode()</code> bytes and
+<code>BitValuePointer</code> is set.</li>
+<li>Small values stay inline.</li>
+<li><code>Key</code> remains internal key throughout.</li>
+</ul>
+<h3 id="33-wal-replay--vlog-iteration-decode"><a class="header" href="#33-wal-replay--vlog-iteration-decode">3.3 WAL replay / vlog iteration decode</a></h3>
+<p>Source: <a href="../kv/entry_codec.go"><code>kv/entry_codec.go</code></a>, <a href="../lsm/memtable.go"><code>lsm/memtable.go</code></a></p>
+<ul>
+<li>Decoded records carry internal key bytes in <code>Key</code>.</li>
+<li><code>Value</code> is record payload bytes (inline value or pointer bytes).</li>
+<li><code>CF/Version</code> are derived from key via <code>PopulateInternalMeta</code>.</li>
+</ul>
+<h3 id="34-memtable-index-lookup"><a class="header" href="#34-memtable-index-lookup">3.4 Memtable index lookup</a></h3>
+<p>Source: <a href="../lsm/memtable.go"><code>lsm/memtable.go</code></a>, <a href="../utils/skiplist.go"><code>utils/skiplist.go</code></a>, <a href="../utils/art.go"><code>utils/art.go</code></a></p>
+<ul>
+<li><code>memIndex.Search(...)</code> returns <code>(matchedInternalKey, ValueStruct)</code>.</li>
+<li><code>memTable.Get</code> assembles pooled <code>Entry</code> from this and calls <code>PopulateInternalMeta</code>.</li>
+<li>For miss, <code>Key=nil</code> and zero value struct (sentinel, not a valid record).</li>
+</ul>
+<h3 id="35-sst--iterator-decode"><a class="header" href="#35-sst--iterator-decode">3.5 SST / iterator decode</a></h3>
+<p>Source: <a href="../lsm/builder.go"><code>lsm/builder.go</code></a>, <a href="../lsm/table.go"><code>lsm/table.go</code></a></p>
+<ul>
+<li>Block iterator reconstructs internal key + value struct.</li>
+<li>It calls <code>PopulateInternalMeta</code> before exposing item entry.</li>
+<li><code>table.Search</code> clones key/value and re-populates internal metadata.</li>
+</ul>
+<h3 id="36-internal-read-api-getinternalentry"><a class="header" href="#36-internal-read-api-getinternalentry">3.6 Internal read API (<code>GetInternalEntry</code>)</a></h3>
+<p>Source: <a href="../db.go"><code>db.go</code></a></p>
+<ul>
+<li><code>loadBorrowedEntry</code> fetches from LSM.</li>
+<li>If <code>BitValuePointer</code> is set:
+<ul>
+<li>decode pointer from <code>Value</code></li>
+<li>read real bytes from vlog</li>
+<li>replace <code>Value</code> with actual value bytes</li>
+<li>clear <code>BitValuePointer</code></li>
+</ul>
+</li>
+<li>Return entry with internal key still in <code>Key</code>, and <code>CF/Version</code> re-populated.</li>
+</ul>
+<h3 id="37-public-read-api-get-public-iterator"><a class="header" href="#37-public-read-api-get-public-iterator">3.7 Public read API (<code>Get</code>, public iterator)</a></h3>
+<p>Source: <a href="../db.go"><code>db.go</code></a>, <a href="../iterator.go"><code>iterator.go</code></a></p>
+<ul>
+<li>Public APIs convert internal key to user key for external consumers.</li>
+<li>Returned entry is detached copy (<code>DB.Get</code>) or iterator materialized object.</li>
+</ul>
+<h3 id="38-runtime-state-flow-diagram"><a class="header" href="#38-runtime-state-flow-diagram">3.8 Runtime State Flow Diagram</a></h3>
+<pre class="mermaid">flowchart TD
+  A["DB.Set/SetWithTTL/Del"] --&gt; B["kv.NewInternalEntry"]
+  B --&gt; C["DB.ApplyInternalEntries"]
+  C --&gt; D["commitWorker: vlog.write"]
+  D --&gt; E["LSM/WAL persist"]
+  E --&gt; F["DB.GetInternalEntry"]
+  F --&gt; G{"BitValuePointer?"}
+  G -- yes --&gt; H["vlog.read + clear pointer bit"]
+  G -- no --&gt; I["inline value"]
+  H --&gt; J["PopulateInternalMeta"]
+  I --&gt; J
+  J --&gt; K["DB.Get cloneEntry -&gt; user key/value"]
+  J --&gt; L["DB.NewIterator materialize -&gt; user key/value"]
+</pre>
+
+<hr>
+<h2 id="4-field-validity-matrix"><a class="header" href="#4-field-validity-matrix">4. Field Validity Matrix</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Context</th><th><code>Key</code></th><th><code>Value</code></th><th><code>CF/Version</code></th><th>Ownership</th></tr>
+</thead>
+<tbody>
+<tr><td>Internal write path</td><td>Internal key</td><td>Inline value or ptr-bytes (large values)</td><td>Valid (set at build/validate time)</td><td>Borrowed/pooled</td></tr>
+<tr><td>Decoded WAL/vlog record</td><td>Internal key</td><td>Encoded record payload value bytes</td><td>Valid after <code>PopulateInternalMeta</code></td><td>Borrowed/pooled</td></tr>
+<tr><td><code>GetInternalEntry</code> return</td><td>Internal key</td><td>Real value bytes (pointer resolved)</td><td>Valid (re-populated before return)</td><td>Borrowed/pooled</td></tr>
+<tr><td><code>DB.Get</code> return</td><td>User key</td><td>Real value bytes</td><td>Valid for external semantics</td><td>Detached copy</td></tr>
+<tr><td>Memtable miss sentinel</td><td><code>nil</code></td><td><code>nil</code></td><td><code>CFDefault/0</code></td><td>Borrowed/pooled sentinel</td></tr>
+</tbody>
+</table>
+</div>
+<p>Rule of thumb:</p>
+<ul>
+<li>Internal code should treat <code>Key</code> as authoritative.</li>
+<li><code>CF/Version</code> should be expected to match <code>SplitInternalKey(Key)</code> after
+<code>PopulateInternalMeta</code>.</li>
+</ul>
+<hr>
+<h2 id="5-populateinternalmeta-semantics"><a class="header" href="#5-populateinternalmeta-semantics">5. <code>PopulateInternalMeta</code> Semantics</a></h2>
+<p>Source: <a href="../kv/entry.go"><code>kv/entry.go</code></a></p>
+<pre><code class="language-go">func (e *Entry) PopulateInternalMeta() bool
+</code></pre>
+<p>Behavior:</p>
+<ol>
+<li>Parse <code>e.Key</code> as internal key.</li>
+<li>If parse succeeds:
+<ul>
+<li><code>e.CF = parsedCF</code></li>
+<li><code>e.Version = parsedTS</code></li>
+<li>return <code>true</code></li>
+</ul>
+</li>
+<li>If parse fails:
+<ul>
+<li>reset cache fields to safe defaults (<code>CFDefault</code>, <code>Version=0</code>)</li>
+<li>return <code>false</code></li>
+</ul>
+</li>
+</ol>
+<p>Why it exists:</p>
+<ul>
+<li>pooled entries can carry stale cached fields if not reset carefully;</li>
+<li>parse-once helper gives a single normalization point at codec/index/read boundaries;</li>
+<li>keeps key-derived metadata (<code>CF/Version</code>) authoritative and consistent.</li>
+</ul>
+<hr>
+<h2 id="6-ownership-and-refcount-states"><a class="header" href="#6-ownership-and-refcount-states">6. Ownership and Refcount States</a></h2>
+<p>Source: <a href="../kv/entry.go"><code>kv/entry.go</code></a>, <a href="#nokv-architecture-overview"><code>docs/architecture.md</code></a></p>
+<h3 id="borrowed-entry-internal"><a class="header" href="#borrowed-entry-internal">Borrowed entry (internal)</a></h3>
+<p>Returned by:</p>
+<ul>
+<li><code>DecodeEntryFrom</code></li>
+<li><code>memTable.Get</code></li>
+<li><code>LSM.Get</code> internals</li>
+<li><code>DB.GetInternalEntry</code></li>
+</ul>
+<p>Contract:</p>
+<ul>
+<li>caller must call <code>DecrRef()</code> exactly once.</li>
+<li>double release panics (underflow guard).</li>
+</ul>
+<h3 id="detached-entry-public"><a class="header" href="#detached-entry-public">Detached entry (public)</a></h3>
+<p>Returned by:</p>
+<ul>
+<li><code>DB.Get</code> (via clone)</li>
+</ul>
+<p>Contract:</p>
+<ul>
+<li>do <strong>not</strong> call <code>DecrRef()</code>.</li>
+</ul>
+<hr>
+<h2 id="7-contributor-rules"><a class="header" href="#7-contributor-rules">7. Contributor Rules</a></h2>
+<ol>
+<li>Any new internal decode boundary should either:
+<ul>
+<li>call <code>PopulateInternalMeta</code>, or</li>
+<li>immediately parse key with <code>SplitInternalKey</code> and set fields consistently.</li>
+</ul>
+</li>
+<li>Do not reintroduce value-side version caches.</li>
+<li>Keep internal APIs internal-key-first; only external APIs should expose user keys.</li>
+<li>Preserve borrowed/detached ownership contracts in comments and tests.</li>
+</ol>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="configuration--options"><a class="header" href="#configuration--options">Configuration &amp; Options</a></h1>
 <p>NoKV exposes two configuration surfaces:</p>
@@ -861,7 +1427,7 @@ if err := cfg.Validate(); err != nil { /* handle */ }
 </ul>
 <h3 id="nokv-serve"><a class="header" href="#nokv-serve"><code>nokv serve</code></a></h3>
 <ul>
-<li>Starts TinyKv gRPC service backed by local <code>raftstore</code></li>
+<li>Starts NoKV gRPC service backed by local <code>raftstore</code></li>
 <li>Requires <code>--workdir</code>, <code>--store-id</code>, and <code>--pd-addr</code></li>
 <li>Common flags:
 <ul>
@@ -905,7 +1471,7 @@ if err := cfg.Validate(); err != nil { /* handle */ }
 <p>The memtable index is an interface that can be backed by either a skiplist or ART:</p>
 <pre><code class="language-go">type memIndex interface {
     Add(*kv.Entry)
-    Search([]byte) kv.ValueStruct
+    Search([]byte) ([]byte, kv.ValueStruct)
     NewIterator(*utils.Options) utils.Iterator
     MemSize() int64
     IncrRef()
@@ -942,7 +1508,7 @@ if err := cfg.Validate(); err != nil { /* handle */ }
 <hr>
 <h2 id="3-read-semantics"><a class="header" href="#3-read-semantics">3. Read Semantics</a></h2>
 <ul>
-<li><code>memTable.Get</code> looks up the chosen index and returns a borrowed, ref-counted <code>*kv.Entry</code> from the internal pool. Internal callers must release it with <code>DecrRef</code> when done. MVCC versions stay encoded in internal keys (<code>InternalKey(CFDefault, userKey, ts)</code> for default-CF paths), so iterators naturally merge across memtables and SSTables.</li>
+<li><code>memTable.Get</code> looks up the chosen index and returns a borrowed, ref-counted <code>*kv.Entry</code> from the internal pool. The index search returns the <strong>matched internal key</strong> plus value struct, so memtable hit entries carry the concrete version key instead of the query sentinel key. Internal callers must release borrowed entries with <code>DecrRef</code> when done.</li>
 <li><code>MemTable.IncrRef/DecrRef</code> delegate to the index, allowing iterators to hold references while the flush manager processes immutable tables—mirroring RocksDB’s <code>MemTable::Ref/Unref</code> lifecycle.</li>
 <li>WAL-backed values that exceed the value threshold are stored as pointers; the memtable stores the encoded pointer, and the transaction/iterator logic reads from the vlog on demand.</li>
 <li><code>DB.Get</code> returns detached entries; callers must not call <code>DecrRef</code> on them.</li>
@@ -1034,7 +1600,7 @@ if err := cfg.Validate(); err != nil { /* handle */ }
 <ul>
 <li>Writes to <code>"&lt;table&gt;.tmp.&lt;pid&gt;.&lt;ns&gt;"</code>.</li>
 <li><code>tmp.Sync()</code> to persist SST bytes.</li>
-<li><code>RenameNoReplace(tmp, final)</code> installs file atomically (or fallback semantics on unsupported platforms).</li>
+<li><code>RenameNoReplace(tmp, final)</code> installs file atomically. If unsupported by platform/filesystem, returns <code>vfs.ErrRenameNoReplaceUnsupported</code>.</li>
 <li><code>SyncDir(workdir)</code> is called before manifest edit so directory entry is durable.</li>
 </ul>
 </li>
@@ -1136,7 +1702,7 @@ if err := cfg.Validate(); err != nil { /* handle */ }
 </tbody>
 </table>
 </div>
-<p><code>CacheMetrics()</code> on <code>DB</code> surfaces hits/misses per layer, which is especially helpful when tuning ingest behaviour—if L0/L1 cache misses spike, the ingest buffer likely needs to be drained faster. <code>TestCacheHotColdMetrics</code> verifies cache hit accounting.</p>
+<p>Cache hit/miss signals are exported through <code>StatsSnapshot.Cache</code> (and surfaced by <code>nokv stats</code> / expvar), which is especially helpful when tuning ingest behaviour—if L0/L1 cache misses spike, the ingest buffer likely needs to be drained faster. <code>TestCacheHotColdMetrics</code> verifies cache hit accounting.</p>
 <hr>
 <h2 id="5-interaction-with-value-log"><a class="header" href="#5-interaction-with-value-log">5. Interaction with Value Log</a></h2>
 <p>Compaction informs value‑log GC via discard statistics:</p>
@@ -1172,7 +1738,7 @@ if err := cfg.Validate(); err != nil { /* handle */ }
 <h2 id="7-practical-tips"><a class="header" href="#7-practical-tips">7. Practical Tips</a></h2>
 <ul>
 <li>Tune <code>Options.IngestCompactBatchSize</code> when ingest queues build up; increasing it lets a single move cover more tables.</li>
-<li>Observe <code>DB.CacheMetrics()</code> and <code>DB.CompactionStats()</code> via the CLI (<code>nokv stats</code>) to decide whether you need more compaction workers or bigger caches.</li>
+<li>Observe <code>NoKV.Stats.cache.*</code> and <code>NoKV.Stats.compaction.*</code> via the CLI (<code>nokv stats</code>) to decide whether you need more compaction workers or bigger caches.</li>
 <li>For workloads dominated by range scans, consider increasing <code>Options.BlockCacheSize</code> if you want to keep more L0/L1 blocks in the user-space cache; cold data relies on the OS page cache.</li>
 <li>Keep an eye on <code>NoKV.Stats.value_log.gc</code> (for example <code>gc_runs</code> and <code>head_updates</code>); if compactions are generating discard stats but the value log head doesn’t move, GC thresholds may be too conservative.</li>
 </ul>
@@ -1255,7 +1821,12 @@ uint32 checksum (CRC32 Castagnoli over type + payload)
 <hr>
 <h2 id="3-public-api-go"><a class="header" href="#3-public-api-go">3. Public API (Go)</a></h2>
 <pre><code class="language-go">mgr, _ := wal.Open(wal.Config{Dir: path})
-infos, _ := mgr.Append(batchPayload)
+info, _ := mgr.AppendEntry(entry)
+batchInfo, _ := mgr.AppendEntryBatch(entries)
+typedInfos, _ := mgr.AppendRecords(wal.Record{
+    Type:    wal.RecordTypeRaftEntry,
+    Payload: raftPayload,
+})
 _ = mgr.Sync()
 _ = mgr.Rotate()
 _ = mgr.Replay(func(info wal.EntryInfo, payload []byte) error {
@@ -1265,7 +1836,7 @@ _ = mgr.Replay(func(info wal.EntryInfo, payload []byte) error {
 </code></pre>
 <p>Key behaviours:</p>
 <ul>
-<li><code>Append</code> automatically calls <code>ensureCapacity</code> to decide when to rotate; it returns <code>EntryInfo{SegmentID, Offset, Length}</code> for each payload so higher layers can build value pointers or manifest checkpoints.</li>
+<li><code>AppendEntry</code>/<code>AppendEntryBatch</code>/<code>AppendRecords</code> automatically call <code>ensureCapacity</code> to decide when to rotate; they return <code>EntryInfo{SegmentID, Offset, Length}</code> so upper layers can keep manifest/raft pointers.</li>
 <li><code>Sync</code> flushes the active file (used for <code>Options.SyncWrites</code>).</li>
 <li><code>Rotate</code> forces a new segment (used after flush/compaction checkpoints similar to RocksDB’s <code>LogFileManager::SwitchLog</code>).</li>
 <li><code>Replay</code> iterates segments in numeric order, forwarding each payload to the callback. Errors abort replay so recovery can surface corruption early.</li>
@@ -1281,8 +1852,8 @@ _ = mgr.Replay(func(info wal.EntryInfo, payload []byte) error {
 </thead>
 <tbody>
 <tr><td><code>lsm.memTable.set</code></td><td>Encodes each entry (<code>kv.EncodeEntry</code>) and appends to WAL before inserting into the skiplist.</td></tr>
-<tr><td><code>DB.commitWorker</code></td><td>Commit worker applies batched writes via <code>writeToLSM</code>, which flows into <code>lsm.Set</code> and thus WAL.</td></tr>
-<tr><td><code>DB.Set</code></td><td>Direct write path: calls <code>lsm.Set</code>, which appends to WAL and updates the memtable.</td></tr>
+<tr><td><code>DB.commitWorker</code></td><td>Commit worker applies batched writes via <code>writeToLSM</code>, which calls <code>lsm.SetBatch</code> and appends one WAL entry-batch record per request batch.</td></tr>
+<tr><td><code>DB.Set</code> / <code>DB.SetWithTTL</code> / <code>DB.Del</code> / <code>DB.ApplyInternalEntries</code></td><td>User/internal writes all flow through the same commit queue and eventually reach <code>lsm.SetBatch</code> + WAL append.</td></tr>
 <tr><td><code>lsm/levels.go::flush</code></td><td>Persists WAL checkpoint via <code>manifest.LogEdits(EditAddFile, EditLogPointer)</code> during flush install.</td></tr>
 <tr><td><code>lsm/levels.go::flush</code> + <code>lsm/levelManager.canRemoveWalSegment</code></td><td>Removes obsolete WAL segments after checkpoint/raft constraints are satisfied.</td></tr>
 <tr><td><code>db.runRecoveryChecks</code></td><td>Ensures WAL directory invariants before manifest replay, similar to Badger’s directory bootstrap.</td></tr>
@@ -1330,7 +1901,7 @@ surface warnings when raft-typed records dominate the log. It:</p>
 <hr>
 <h2 id="8-operational-tips"><a class="header" href="#8-operational-tips">8. Operational Tips</a></h2>
 <ul>
-<li>Configure <code>SyncOnWrite</code> for synchronous durability (default async like RocksDB’s default). For latency-sensitive deployments, consider enabling to emulate Badger’s <code>SyncWrites</code>.</li>
+<li>Configure <code>Options.SyncWrites=true</code> for synchronous durability (default async, similar to RocksDB’s default).</li>
 <li>After large flushes, forcing <code>Rotate</code> keeps WAL files short, reducing replay time.</li>
 <li>Archived WAL segments can be copied alongside manifest files for hot-backup strategies—since the manifest contains the WAL log number, snapshots behave like RocksDB’s <code>Checkpoints</code>.</li>
 </ul>
@@ -1644,10 +2215,10 @@ _ = mgr.Remove(fid)  // close + delete file
 <p><code>RenameNoReplace</code>:</p>
 <ul>
 <li>contract: fail with <code>os.ErrExist</code> when destination already exists.</li>
-<li>on Linux, uses <code>renameat2(..., RENAME_NOREPLACE)</code> when supported.</li>
-<li>fallback path (<code>renameNoReplaceFallback</code>) checks destination existence then calls <code>Rename</code>.</li>
+<li>on Linux, uses <code>renameat2(..., RENAME_NOREPLACE)</code>.</li>
+<li>on macOS, uses <code>renamex_np(..., RENAME_EXCL)</code>.</li>
+<li>when atomic no-replace rename is unsupported by platform/filesystem, returns <code>vfs.ErrRenameNoReplaceUnsupported</code> (no non-atomic fallback).</li>
 </ul>
-<p>Important: fallback is <strong>not atomic</strong> and has TOCTOU risk. Callers needing strict no-overwrite atomicity should avoid relying on fallback behavior.</p>
 <hr>
 <h2 id="3-directory-sync-helper"><a class="header" href="#3-directory-sync-helper">3. Directory Sync Helper</a></h2>
 <p><code>vfs.SyncDir(fs, dir)</code> fsyncs directory metadata to persist entry updates (create/rename/remove).</p>
@@ -1692,8 +2263,8 @@ _ = mgr.Remove(fid)  // close + delete file
 </thead>
 <tbody>
 <tr><td><a href="../file/file.go#L5-L16"><code>Options</code></a></td><td>Parameter bag for opening files (FID, path, size).</td><td>Used by WAL/vlog managers.</td></tr>
-<tr><td><a href="../file/mmap_linux.go#L12-L98"><code>MmapFile</code></a></td><td>Cross-platform mmap wrapper.</td><td><code>OpenMmapFile</code>, <code>AppendBuffer</code>, <code>Truncature</code>, <code>Sync</code>.</td></tr>
-<tr><td><a href="../file/vlog.go#L16-L130"><code>LogFile</code></a></td><td>Value-log specific helper built on <code>MmapFile</code>.</td><td><code>Open</code>, <code>Write</code>, <code>Read</code>, <code>DoneWriting</code>, <code>EncodeEntry</code>.</td></tr>
+<tr><td><a href="../file/mmap_linux.go#L12-L98"><code>MmapFile</code></a></td><td>Cross-platform mmap wrapper.</td><td><code>OpenMmapFile</code>, <code>AppendBuffer</code>, <code>Truncate</code>, <code>Sync</code>.</td></tr>
+<tr><td><a href="../file/vlog.go#L17-L223"><code>LogFile</code></a></td><td>Value-log specific helper built on <code>MmapFile</code>.</td><td><code>Open</code>, <code>Write</code>, <code>Read</code>, <code>DoneWriting</code>, <code>Truncate</code>, <code>Bootstrap</code>.</td></tr>
 </tbody>
 </table>
 </div>
@@ -1702,7 +2273,7 @@ _ = mgr.Remove(fid)  // close + delete file
 <h2 id="2-mmap-management"><a class="header" href="#2-mmap-management">2. Mmap Management</a></h2>
 <ul>
 <li><code>OpenMmapFile</code> opens or creates a file, optionally extending it to <code>maxSz</code>, then mmaps it. The returned <code>MmapFile</code> exposes <code>Data []byte</code> and the underlying <code>*os.File</code> handle.</li>
-<li>Writes grow the map on demand: <code>AppendBuffer</code> checks if the write would exceed the current mapping and calls <code>Truncature</code> to expand (doubling up to 1 GiB increments).</li>
+<li>Writes grow the map on demand: <code>AppendBuffer</code> checks if the write would exceed the current mapping and calls <code>Truncate</code> to expand (doubling up to 1 GiB increments).</li>
 <li><code>Sync</code> flushes dirty pages (<code>mmap.Msync</code>), while <code>Delete</code> unmaps, truncates, closes, and removes the file—used when dropping SSTs or value-log segments.</li>
 </ul>
 <p>RocksDB relies on custom Env implementations for portability; NoKV keeps the logic in Go, relying on build tags for OS differences.</p>
@@ -1711,14 +2282,15 @@ _ = mgr.Remove(fid)  // close + delete file
 <p><code>LogFile</code> wraps <code>MmapFile</code> to simplify value-log operations:</p>
 <pre><code class="language-go">lf := &amp;file.LogFile{}
 _ = lf.Open(&amp;file.Options{FID: 1, FileName: "00001.vlog", MaxSz: 1&lt;&lt;29})
-ptr, _ := lf.EncodeEntry(entry, buf, offset)
-_ = lf.Write(offset, buf.Bytes())
-_ = lf.DoneWriting(nextOffset)
+var buf bytes.Buffer
+payload, _ := kv.EncodeEntry(&amp;buf, entry)
+_ = lf.Write(offset, payload)
+_ = lf.DoneWriting(offset + uint32(len(payload)))
 </code></pre>
 <ul>
 <li><code>Open</code> mmaps the file and records current size (guarded to <code>&lt; 4 GiB</code>).</li>
 <li><code>Read</code> validates offsets against both the mmap length and tracked size, preventing partial reads when GC or drop operations shrink the file.</li>
-<li><code>EncodeEntry</code> uses the shared <code>kv.EntryHeader</code> and CRC32 helpers to produce the exact on-disk layout consumed by <code>vlog.Manager</code> and <code>wal.Manager</code>.</li>
+<li>Entry encoding uses shared helpers in <code>kv</code> (<code>kv.EncodeEntry</code> / <code>kv.EncodeEntryTo</code>); <code>LogFile</code> focuses on write/read/truncate + durability semantics.</li>
 <li><code>DoneWriting</code> guarantees durability for both data bytes <code>[0, offset)</code> and the file metadata (size).
 <ul>
 <li>Sequence: It flushes dirty pages (<code>msync</code>), truncates the file to <code>offset</code>, and performs a file-descriptor level sync (<code>fsync</code>) to ensure the new file size is persisted on disk before returning.</li>
@@ -1751,7 +2323,7 @@ _ = lf.DoneWriting(nextOffset)
 <ul>
 <li><code>DoneWriting</code> provides strong crash-consistency guarantees. Even on filesystems where <code>ftruncate</code> metadata persistence is asynchronous, the explicit post-truncate <code>fsync</code> ensures the file size is durable upon success.</li>
 <li>Value-log and WAL segments rely on <code>DoneWriting</code>/<code>Truncate</code> to seal files; avoid manipulating files externally or mmap metadata may desynchronise.</li>
-<li><code>LogFile.AddSize</code> updates the cached size used by reads—critical when rewinding or rewriting segments.</li>
+<li><code>LogFile</code> updates cached size internally on <code>Write</code>/<code>Truncate</code>, so read bounds stay consistent during rewrite/rewind flows.</li>
 <li><code>vfs.SyncDir</code> is used by strict durability flows to persist directory entry changes (create/rename/remove). For example, strict SST flush calls <code>SyncDir(workdir)</code> before manifest publication.</li>
 </ul>
 <p>For more on how these primitives plug into higher layers, see <a href="#wal-subsystem"><code>docs/wal.md</code></a> and <a href="#value-log-vlog-design"><code>docs/vlog.md</code></a>.</p>
@@ -1980,7 +2552,7 @@ settings. When override is enabled, <strong>zeros disable features</strong> (exc
 which falls back to the ring default).</p>
 <hr>
 <h2 id="7-write-path-throttling"><a class="header" href="#7-write-path-throttling">7. Write-Path Throttling</a></h2>
-<p><code>Options.WriteHotKeyLimit</code> wires the write-only HotRing into the write path. When set to a positive integer, every call to <code>DB.Set*</code>/<code>DB.SetEntry</code> invokes <code>HotRing.TouchAndClamp</code> with the limit. Once a key (optionally scoped by column family via <code>cfHotKey</code>) reaches the limit, the write is rejected with <code>utils.ErrHotKeyWriteThrottle</code>. If throttling is disabled but <code>HotWriteBurstThreshold &gt; 0</code>, the write ring still tracks frequency to enable hot write batching. This keeps pathological tenants or hot shards from overwhelming a single Raft group without adding heavyweight rate-limiters to the client stack.</p>
+<p><code>Options.WriteHotKeyLimit</code> wires the write-only HotRing into the write path. When set to a positive integer, user writes (<code>DB.Set</code>, <code>DB.SetWithTTL</code>) and internal writes (<code>DB.ApplyInternalEntries</code>) invoke <code>HotRing.TouchAndClamp</code> with the limit. Once a key (optionally scoped by column family via <code>cfHotKey</code>) reaches the limit, the write is rejected with <code>utils.ErrHotKeyWriteThrottle</code>. If throttling is disabled but <code>HotWriteBurstThreshold &gt; 0</code>, the write ring still tracks frequency to enable hot write batching. This keeps pathological tenants or hot shards from overwhelming a single Raft group without adding heavyweight rate-limiters to the client stack.</p>
 <p>Operational hints:</p>
 <ul>
 <li><code>StatsSnapshot.Write.HotKeyLimited</code> and the CLI line <code>Write.HotKeyThrottled</code> expose how many writes were rejected since the process started.</li>
@@ -2082,12 +2654,11 @@ inherits the global <code>HotRing*</code> configuration.</p>
 <li><code>CheckTxnStatus</code></li>
 <li>MVCC read visibility (<code>KvGet</code>/<code>KvScan</code> through <code>percolator.Reader</code>)</li>
 </ul>
-<p>It does not describe the removed standalone transaction API.</p>
 <hr>
 <h2 id="1-where-it-runs"><a class="header" href="#1-where-it-runs">1. Where It Runs</a></h2>
 <p>Percolator logic is executed on the Raft apply path:</p>
 <ol>
-<li>Client sends TinyKV RPC (<code>KvPrewrite</code>, <code>KvCommit</code>, …).</li>
+<li>Client sends NoKV RPC (<code>KvPrewrite</code>, <code>KvCommit</code>, …).</li>
 <li><code>raftstore/kv/service.go</code> wraps it into a <code>RaftCmdRequest</code>.</li>
 <li>Store proposes command through Raft.</li>
 <li>On apply, <code>raftstore/kv/apply.go</code> dispatches to <code>percolator.*</code>.</li>
@@ -2105,7 +2676,7 @@ inherits the global <code>HotRing*</code> configuration.</p>
     A-&gt;&gt;P: percolator.Prewrite/Commit...
     P-&gt;&gt;DB: CFDefault/CFLock/CFWrite reads+writes
     A--&gt;&gt;S: RaftCmdResponse
-    S--&gt;&gt;C: TinyKV RPC response
+    S--&gt;&gt;C: NoKV RPC response
 </pre>
 
 <p>Key files:</p>
@@ -2117,6 +2688,23 @@ inherits the global <code>HotRing*</code> configuration.</p>
 <li><a href="../raftstore/kv/apply.go"><code>raftstore/kv/apply.go</code></a></li>
 <li><a href="../raftstore/client/client.go"><code>raftstore/client/client.go</code></a></li>
 </ul>
+<h3 id="11-rpc-to-percolator-function-mapping"><a class="header" href="#11-rpc-to-percolator-function-mapping">1.1 RPC to Percolator Function Mapping</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>NoKV RPC</th><th><code>kv.Apply</code> branch</th><th>Percolator function</th></tr>
+</thead>
+<tbody>
+<tr><td><code>KvPrewrite</code></td><td><code>CMD_PREWRITE</code></td><td><code>Prewrite</code></td></tr>
+<tr><td><code>KvCommit</code></td><td><code>CMD_COMMIT</code></td><td><code>Commit</code></td></tr>
+<tr><td><code>KvBatchRollback</code></td><td><code>CMD_BATCH_ROLLBACK</code></td><td><code>BatchRollback</code></td></tr>
+<tr><td><code>KvResolveLock</code></td><td><code>CMD_RESOLVE_LOCK</code></td><td><code>ResolveLock</code></td></tr>
+<tr><td><code>KvCheckTxnStatus</code></td><td><code>CMD_CHECK_TXN_STATUS</code></td><td><code>CheckTxnStatus</code></td></tr>
+<tr><td><code>KvGet</code></td><td><code>CMD_GET</code></td><td><code>Reader.GetLock</code> + <code>Reader.GetValue</code></td></tr>
+<tr><td><code>KvScan</code></td><td><code>CMD_SCAN</code></td><td><code>Reader.GetLock</code> + CFWrite iteration + <code>GetInternalEntry</code></td></tr>
+</tbody>
+</table>
+</div>
 <hr>
 <h2 id="2-mvcc-data-model"><a class="header" href="#2-mvcc-data-model">2. MVCC Data Model</a></h2>
 <p>NoKV uses three MVCC column families:</p>
@@ -2149,9 +2737,10 @@ inherits the global <code>HotRing*</code> configuration.</p>
 <li>Stripes are deduplicated and acquired in sorted order to avoid deadlocks.</li>
 <li>Guard releases in reverse order.</li>
 </ul>
-<p>In <code>kv/apply.go</code>, one process-wide manager is used:</p>
+<p>In <code>raftstore/kv</code>, latches are passed explicitly:</p>
 <ul>
-<li><code>defaultLatches = latch.NewManager(512)</code></li>
+<li><code>NewEntryApplier</code> creates one <code>latch.NewManager(512)</code> and reuses it.</li>
+<li><code>Apply</code> / <code>NewApplier</code> accept an injected manager; <code>nil</code> falls back to <code>latch.NewManager(512)</code>.</li>
 </ul>
 <p>This serializes conflicting apply operations on overlapping keys in one node.</p>
 <hr>
@@ -2176,7 +2765,7 @@ inherits the global <code>HotRing*</code> configuration.</p>
 
 <hr>
 <h2 id="5-write-side-operations"><a class="header" href="#5-write-side-operations">5. Write-Side Operations</a></h2>
-<h2 id="51-prewrite"><a class="header" href="#51-prewrite">5.1 Prewrite</a></h2>
+<h3 id="51-prewrite"><a class="header" href="#51-prewrite">5.1 Prewrite</a></h3>
 <p><code>Prewrite</code> runs mutation-by-mutation:</p>
 <ol>
 <li>Check existing lock on key:
@@ -2317,12 +2906,14 @@ inherits the global <code>HotRing*</code> configuration.</p>
 </table>
 </div>
 <hr>
-<h2 id="9-current-constraints"><a class="header" href="#9-current-constraints">9. Current Constraints</a></h2>
+<h2 id="9-current-operational-boundaries"><a class="header" href="#9-current-operational-boundaries">9. Current Operational Boundaries</a></h2>
 <ul>
-<li>This path is distributed-only and tied to TinyKV RPC + Raft apply.</li>
-<li>Standalone/local transaction APIs are intentionally removed.</li>
-<li>Latch scope is per-node process (<code>defaultLatches</code>), with region-level correctness coming from Raft sequencing.</li>
-<li><code>Write.ShortValue</code> is encoded/decoded but not used by current commit writer.</li>
+<li>Percolator execution is tied to NoKV RPC + Raft apply path, with the command shape still following the TinyKV/TiKV MVCC model.</li>
+<li>Latch scope is process-local when one store shares a single <code>latch.Manager</code>;
+region correctness still comes from Raft ordering.</li>
+<li><code>Write.ShortValue</code> and <code>Write.ExpiresAt</code> are codec fields; current commit path
+stores primary value bytes in <code>CFDefault</code> and reads from there when short value
+is not present.</li>
 </ul>
 <hr>
 <h2 id="10-validation-and-tests"><a class="header" href="#10-validation-and-tests">10. Validation and Tests</a></h2>
@@ -2336,7 +2927,7 @@ inherits the global <code>HotRing*</code> configuration.</p>
 <p>These tests cover 2PC happy path, lock conflicts, status checks, resolve/rollback behavior, and client region-aware retries.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="raftstore-deep-dive"><a class="header" href="#raftstore-deep-dive">RaftStore Deep Dive</a></h1>
-<p><code>raftstore</code> powers NoKV’s distributed mode by layering multi-Raft replication on top of the embedded storage engine. This note explains the major packages, the boot and command paths, how transport and storage interact, and the supporting tooling for observability and testing.</p>
+<p><code>raftstore</code> powers NoKV’s distributed mode by layering multi-Raft replication on top of the embedded storage engine. Its RPC surface is exposed as the <code>NoKV</code> gRPC service, while the command model still tracks the TinyKV/TiKV region + MVCC design. This note explains the major packages, the boot and command paths, how transport and storage interact, and the supporting tooling for observability and testing.</p>
 <hr>
 <h2 id="1-package-structure"><a class="header" href="#1-package-structure">1. Package Structure</a></h2>
 <div class="table-wrapper">
@@ -2348,9 +2939,9 @@ inherits the global <code>HotRing*</code> configuration.</p>
 <tr><td><a href="../raftstore/store"><code>store</code></a></td><td>Orchestrates peer set, command pipeline, region manager, scheduler/heartbeat loops; exposes helpers such as <code>StartPeer</code>, <code>ProposeCommand</code>, <code>SplitRegion</code>.</td></tr>
 <tr><td><a href="../raftstore/peer"><code>peer</code></a></td><td>Wraps etcd/raft <code>RawNode</code>, drives Ready processing (persist to WAL, send messages, apply entries), tracks snapshot resend/backlog.</td></tr>
 <tr><td><a href="../raftstore/engine"><code>engine</code></a></td><td>WALStorage/DiskStorage/MemoryStorage across all Raft groups, leveraging the NoKV WAL while keeping manifest metadata in sync.</td></tr>
-<tr><td><a href="../raftstore/transport"><code>transport</code></a></td><td>gRPC transport with retry/TLS/backpressure; exposes the raft Step RPC and can host additional services (TinyKv).</td></tr>
-<tr><td><a href="../raftstore/kv"><code>kv</code></a></td><td>TinyKv RPC implementation, bridging Raft commands to MVCC operations via <code>kv.Apply</code>.</td></tr>
-<tr><td><a href="../raftstore/server"><code>server</code></a></td><td><code>ServerConfig</code> + <code>New</code> that bind DB, Store, transport, and TinyKv server into a reusable node primitive.</td></tr>
+<tr><td><a href="../raftstore/transport"><code>transport</code></a></td><td>gRPC transport with retry/TLS/backpressure; exposes the raft Step RPC and can host additional services (NoKV).</td></tr>
+<tr><td><a href="../raftstore/kv"><code>kv</code></a></td><td>NoKV RPC implementation, bridging Raft commands to MVCC operations via <code>kv.Apply</code>.</td></tr>
+<tr><td><a href="../raftstore/server"><code>server</code></a></td><td><code>ServerConfig</code> + <code>New</code> that bind DB, Store, transport, and NoKV server into a reusable node primitive.</td></tr>
 </tbody>
 </table>
 </div>
@@ -2367,7 +2958,7 @@ inherits the global <code>HotRing*</code> configuration.</p>
 })
 </code></pre>
 <ul>
-<li>A gRPC transport is created, the TinyKv service is registered, and <code>transport.SetHandler(store.Step)</code> wires raft Step handling.</li>
+<li>A gRPC transport is created, the NoKV service is registered, and <code>transport.SetHandler(store.Step)</code> wires raft Step handling.</li>
 <li><code>store.Store</code> loads <code>manifest.RegionSnapshot()</code> to rebuild the Region catalog (router + metrics).</li>
 </ul>
 </li>
@@ -2393,8 +2984,8 @@ inherits the global <code>HotRing*</code> configuration.</p>
 <ol>
 <li><code>kv.Service.KvGet</code> builds <code>pb.RaftCmdRequest</code> and invokes <code>Store.ReadCommand</code>.</li>
 <li><code>validateCommand</code> ensures the region exists, epoch matches, and the local peer is leader; a RegionError is returned otherwise.</li>
-<li><code>peer.Flush()</code> drains pending Ready, guaranteeing the latest committed log is applied.</li>
-<li><code>commandApplier</code> (i.e. <code>kv.Apply</code>) runs GET/SCAN directly against the DB, using MVCC readers to honour locks and version visibility.</li>
+<li><code>peer.LinearizableRead</code> obtains a safe read index, then <code>peer.WaitApplied</code> waits until local apply index reaches it.</li>
+<li><code>commandApplier</code> (i.e. <code>kv.Apply</code>) runs GET/SCAN against the DB using MVCC readers to honor locks and version visibility.</li>
 </ol>
 <h3 id="write-via-propose"><a class="header" href="#write-via-propose">Write (via Propose)</a></h3>
 <ol>
@@ -2403,10 +2994,39 @@ inherits the global <code>HotRing*</code> configuration.</p>
 <li><code>engine.WALStorage</code> persists raft entries/state snapshots and updates manifest raft pointers. This keeps WAL GC and raft truncation aligned.</li>
 <li>Raft apply only accepts command-encoded payloads (<code>RaftCmdRequest</code>). Legacy raw KV payloads are rejected as unsupported.</li>
 </ol>
+<h3 id="command-flow-diagram"><a class="header" href="#command-flow-diagram">Command flow diagram</a></h3>
+<pre class="mermaid">sequenceDiagram
+    participant C as NoKV Client
+    participant SVC as kv.Service
+    participant ST as store.Store
+    participant PR as peer.Peer
+    participant RF as raft log/replication
+    participant AP as kv.Apply
+    participant DB as NoKV DB
+
+    rect rgb(237, 247, 255)
+      C-&gt;&gt;SVC: KvGet/KvScan
+      SVC-&gt;&gt;ST: ReadCommand
+      ST-&gt;&gt;PR: LinearizableRead + WaitApplied
+      ST-&gt;&gt;AP: commandApplier(req)
+      AP-&gt;&gt;DB: internal read path
+      AP--&gt;&gt;C: read response
+    end
+
+    rect rgb(241, 253, 244)
+      C-&gt;&gt;SVC: KvPrewrite/KvCommit/...
+      SVC-&gt;&gt;ST: ProposeCommand
+      ST-&gt;&gt;RF: route + replicate
+      RF-&gt;&gt;AP: apply committed entry
+      AP-&gt;&gt;DB: percolator mutate -&gt; ApplyInternalEntries
+      AP--&gt;&gt;C: write response
+    end
+</pre>
+
 <hr>
 <h2 id="4-transport"><a class="header" href="#4-transport">4. Transport</a></h2>
 <ul>
-<li>gRPC transport listens on <code>TransportAddr</code>, serving both raft Step RPC and TinyKv RPC.</li>
+<li>gRPC transport listens on <code>TransportAddr</code>, serving both raft Step RPC and NoKV RPC.</li>
 <li><code>SetPeer</code> updates the mapping of remote store IDs to addresses; <code>BlockPeer</code> can be used by tests or chaos tooling.</li>
 <li>Configurable retry/backoff/timeout options mirror production requirements. Tests cover message loss, blocked peers, and partitions.</li>
 </ul>
@@ -2418,14 +3038,14 @@ inherits the global <code>HotRing*</code> configuration.</p>
 <li>Alternative storage backends (<code>DiskStorage</code>, <code>MemoryStorage</code>) are available for tests and special scenarios.</li>
 </ul>
 <hr>
-<h2 id="6-tinykv-rpc-integration"><a class="header" href="#6-tinykv-rpc-integration">6. TinyKv RPC Integration</a></h2>
+<h2 id="6-nokv-rpc-integration"><a class="header" href="#6-nokv-rpc-integration">6. NoKV RPC Integration</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>RPC</th><th>Execution Path</th><th>Notes</th></tr>
 </thead>
 <tbody>
-<tr><td><code>KvGet</code> / <code>KvScan</code></td><td><code>ReadCommand</code> → <code>kv.Apply</code> (read mode)</td><td>No raft round-trip; leader-only.</td></tr>
+<tr><td><code>KvGet</code> / <code>KvScan</code></td><td><code>ReadCommand</code> → <code>LinearizableRead(ReadIndex)</code> + <code>WaitApplied</code> → <code>kv.Apply</code> (read mode)</td><td>Leader-only strong read with Raft linearizability barrier.</td></tr>
 <tr><td><code>KvPrewrite</code> / <code>KvCommit</code> / <code>KvBatchRollback</code> / <code>KvResolveLock</code> / <code>KvCheckTxnStatus</code></td><td><code>ProposeCommand</code> → command pipeline → raft log → <code>kv.Apply</code></td><td>Pipeline matches proposals with apply results; MVCC latch manager prevents write conflicts.</td></tr>
 </tbody>
 </table>
@@ -2459,8 +3079,8 @@ the runtime source of truth once PD is available.</li>
 <li><strong>Merge</strong>: leaders call <code>Store.ProposeMerge</code>, writing a merge <code>AdminCommand</code>.
 On apply, the target region range/epoch is expanded and the source peer is
 stopped/removed from the manifest.</li>
-<li>These operations are explicit and are not auto-triggered by size/traffic
-heuristics; a higher-level controller could call the same APIs.</li>
+<li>These operations are explicit/manual and are not auto-triggered by
+size/traffic heuristics.</li>
 </ul>
 <hr>
 <h2 id="9-observability"><a class="header" href="#9-observability">9. Observability</a></h2>
@@ -2492,13 +3112,17 @@ heuristics; a higher-level controller could call the same APIs.</li>
 </table>
 </div>
 <hr>
-<h2 id="10-extending-raftstore"><a class="header" href="#10-extending-raftstore">10. Extending raftstore</a></h2>
+<h2 id="10-current-boundaries-and-guarantees"><a class="header" href="#10-current-boundaries-and-guarantees">10. Current Boundaries and Guarantees</a></h2>
 <ul>
-<li><strong>Adding peers</strong>: update the manifest with new Region metadata, then call <code>Store.StartPeer</code> on the target node.</li>
-<li><strong>Follower or lease reads</strong>: extend <code>ReadCommand</code> to include ReadIndex or leader lease checks; current design only serves leader reads.</li>
-<li><strong>Scheduler integration</strong>: use PD as the cluster coordinator and operation source.</li>
+<li>Reads served through <code>ReadCommand</code> are leader-strong and pass a Raft
+linearizability barrier (<code>LinearizableRead</code> + <code>WaitApplied</code>).</li>
+<li>Mutating NoKV RPC commands are serialized through Raft log replication and apply.</li>
+<li>Command payload format on apply path is strict <code>RaftCmdRequest</code> encoding.</li>
+<li>Region metadata (range/epoch/peers) is validated before both read and write
+command execution.</li>
+<li><code>store.RegionMetrics</code> + <code>StatsSnapshot</code> provide runtime visibility for region
+count, backlog, and scheduling health.</li>
 </ul>
-<p>This layering keeps the embedded storage engine intact while providing a production-ready replication path, robust observability, and straightforward integration in both CLI and programmatic contexts.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="pd-lite"><a class="header" href="#pd-lite">PD-lite</a></h1>
 <p><code>PD-lite</code> is NoKV’s control-plane service for distributed mode.<br>It exposes a gRPC API (<code>pb.PD</code>) and is started by:</p>
@@ -2694,7 +3318,8 @@ stronger HA semantics is incremental.</li>
 <li><code>flush.queue_length</code></li>
 <li><code>wal.segment_count</code></li>
 <li><code>value_log.heads</code></li>
-<li><code>value_log.files</code></li>
+<li><code>value_log.segments</code></li>
+<li><code>value_log.pending_deletes</code></li>
 </ul>
 <p>If <code>flush.queue_length</code> remains high after replay, inspect flush worker throughput and manifest sync settings.</p>
 <hr>
@@ -2771,7 +3396,7 @@ stronger HA semantics is incremental.</li>
 <li><code>region.total</code>, <code>region.running</code>, <code>region.removing</code>, <code>region.tombstone</code></li>
 <li><code>hot.read_keys</code>, <code>hot.write_keys</code>, <code>hot.read_ring</code>, <code>hot.write_ring</code></li>
 <li><code>cache.block_l0_hit_rate</code>, <code>cache.bloom_hit_rate</code>, <code>cache.iterator_reused</code></li>
-<li><code>lsm.levels</code>, <code>lsm.value_bytes_total</code>, <code>lsm.column_families</code></li>
+<li><code>lsm.levels</code>, <code>lsm.value_bytes_total</code></li>
 </ul>
 <hr>
 <h2 id="3-expvar-export"><a class="header" href="#3-expvar-export">3. expvar Export</a></h2>
@@ -2851,6 +3476,9 @@ go test ./percolator/... ./raftstore/client/... -run 'Test.*(Commit|Prewrite|Two
 # Crash recovery scenarios
 RECOVERY_TRACE_METRICS=1 ./scripts/recovery_scenarios.sh
 
+# Protobuf schema hygiene
+make proto-check
+
 # gRPC transport chaos tests + watchdog metrics
 CHAOS_TRACE_METRICS=1 ./scripts/transport_chaos.sh
 
@@ -2918,7 +3546,7 @@ NOKV_RUN_BENCHMARKS=1 YCSB_RECORDS=10000 YCSB_OPS=50000 YCSB_WARM_OPS=0 \
 <tr><td>Value separation + GC</td><td><code>vlog/manager_test.go</code>, <code>db_test.go::TestRecoveryRemovesStaleValueLogSegment</code></td><td>GC correctness, manifest integration, iterator stability.</td></tr>
 <tr><td>Iterator consistency</td><td><code>lsm/iterator_test.go</code></td><td>Snapshot visibility, merging iterators across levels and memtables.</td></tr>
 <tr><td>Throttling / backpressure</td><td><code>lsm/compaction_test.go</code>, <code>db_test.go::TestWriteThrottle</code></td><td>L0 backlog triggers, flush queue growth, metrics observation.</td></tr>
-<tr><td>Distributed TinyKv client</td><td><code>raftstore/client/client_test.go::TestClientTwoPhaseCommitAndGet</code>, <code>raftstore/transport/grpc_transport_test.go::TestGRPCTransportManualTicksDriveElection</code></td><td>Region-aware routing, NotLeader retries, manual tick-driven elections, cross-region 2PC sequencing.</td></tr>
+<tr><td>Distributed NoKV client</td><td><code>raftstore/client/client_test.go::TestClientTwoPhaseCommitAndGet</code>, <code>raftstore/transport/grpc_transport_test.go::TestGRPCTransportManualTicksDriveElection</code></td><td>Region-aware routing, NotLeader retries, manual tick-driven elections, cross-region 2PC sequencing.</td></tr>
 <tr><td>Performance regression</td><td><code>benchmark</code> package</td><td>Compare NoKV vs Badger/Pebble by default (RocksDB optional), produce human-readable reports under <code>benchmark/benchmark_results</code>.</td></tr>
 </tbody>
 </table>
@@ -2947,7 +3575,7 @@ NOKV_RUN_BENCHMARKS=1 YCSB_RECORDS=10000 YCSB_OPS=50000 YCSB_WARM_OPS=0 \
 <h2 id="cluster-helpers"><a class="header" href="#cluster-helpers">Cluster helpers</a></h2>
 <h3 id="scriptsrun_local_clustersh"><a class="header" href="#scriptsrun_local_clustersh"><code>scripts/run_local_cluster.sh</code></a></h3>
 <ul>
-<li><strong>Purpose</strong> – builds <code>nokv</code> and <code>nokv-config</code>, reads <code>raft_config.json</code>, seeds manifests, starts PD-lite, and starts the TinyKv nodes. If a store directory already contains a manifest (<code>CURRENT</code>), the seeding step is skipped so previously bootstrapped data is reused.</li>
+<li><strong>Purpose</strong> – builds <code>nokv</code> and <code>nokv-config</code>, reads <code>raft_config.json</code>, seeds manifests, starts PD-lite, and starts the NoKV nodes. If a store directory already contains a manifest (<code>CURRENT</code>), the seeding step is skipped so previously bootstrapped data is reused.</li>
 <li><strong>Usage</strong>
 <pre><code class="language-bash">./scripts/run_local_cluster.sh --config ./raft_config.example.json --workdir ./artifacts/cluster
 </code></pre>
@@ -2990,7 +3618,7 @@ The script iterates over every store in the config and writes Region metadata vi
 <tr><td><code>scripts/transport_chaos.sh</code></td><td>Injects disconnects/blocks/delay into the <code>raftstore</code> transport to observe behaviour under faulty networks.</td></tr>
 <tr><td><code>scripts/run_benchmarks.sh</code></td><td>Executes YCSB benchmarks (default engines: NoKV/Badger/Pebble, workloads A-G; optional RocksDB via build tags).</td></tr>
 <tr><td><code>scripts/debug.sh</code></td><td>Convenience wrapper around <code>dlv test</code> for targeted debugging.</td></tr>
-<tr><td><code>scripts/gen.sh</code></td><td>Generates mock data or helper artefacts (see inline comments for details).</td></tr>
+<tr><td><code>scripts/gen.sh</code></td><td>Generates protobuf Go bindings through Buf with pinned remote plugin versions.</td></tr>
 </tbody>
 </table>
 </div>
@@ -3024,8 +3652,8 @@ The script iterates over every store in the config and writes Region metadata vi
 <tr><th>Mode</th><th>Description</th><th>Key flags</th></tr>
 </thead>
 <tbody>
-<tr><td>Embedded (<code>embedded</code>)</td><td>Opens a local <code>*NoKV.DB</code> work directory. Commands (<code>SET</code>, <code>SET NX/XX</code>, <code>EX/PX/EXAT/PXAT</code>, <code>MSET</code>, <code>INCR/DECR</code>, <code>DEL</code>, <code>MGET</code>, <code>EXISTS</code>, …) run through regular DB APIs (<code>Get/SetEntry/Del</code>) with backend-side synchronization for read-modify-write operations.</td><td><code>--workdir &lt;dir&gt;</code></td></tr>
-<tr><td>Raft (<code>raft</code>)</td><td>Routes requests through <code>raftstore/client</code> and a TinyKv cluster. Writes execute via TwoPhaseCommit; TTL metadata is stored under <code>!redis:ttl!&lt;key&gt;</code>. Routing and TSO allocation are provided by PD-lite over gRPC (PD is runtime route source; config regions are bootstrap metadata).</td><td><code>--raft-config &lt;file&gt;</code><br><code>--pd-addr host:port</code> (optional override; defaults to <code>config.pd</code>)</td></tr>
+<tr><td>Embedded (<code>embedded</code>)</td><td>Opens a local <code>*NoKV.DB</code> work directory. Commands (<code>SET</code>, <code>SET NX/XX</code>, <code>EX/PX/EXAT/PXAT</code>, <code>MSET</code>, <code>INCR/DECR</code>, <code>DEL</code>, <code>MGET</code>, <code>EXISTS</code>, …) run through regular DB APIs (<code>Get/Set/SetWithTTL/Del</code>) with backend-side synchronization for read-modify-write operations.</td><td><code>--workdir &lt;dir&gt;</code></td></tr>
+<tr><td>Raft (<code>raft</code>)</td><td>Routes requests through <code>raftstore/client</code> and a NoKV cluster. Writes execute via TwoPhaseCommit; TTL is persisted directly in entry <code>expires_at</code> metadata (same write path as value updates). Routing and TSO allocation are provided by PD-lite over gRPC (PD is runtime route source; config regions are bootstrap metadata).</td><td><code>--raft-config &lt;file&gt;</code><br><code>--pd-addr host:port</code> (optional override; defaults to <code>config.pd</code>)</td></tr>
 </tbody>
 </table>
 </div>
@@ -3041,7 +3669,7 @@ The script iterates over every store in the config and writes Region metadata vi
 <h3 id="raft-backend"><a class="header" href="#raft-backend">Raft backend</a></h3>
 <ol>
 <li>
-<p>Start TinyKv and PD-lite using the helper script or Docker Compose. Both consume <code>raft_config.example.json</code>, initialise manifests for each store, and launch <code>nokv pd</code> automatically:</p>
+<p>Start NoKV and PD-lite using the helper script or Docker Compose. Both consume <code>raft_config.example.json</code>, initialise manifests for each store, and launch <code>nokv pd</code> automatically:</p>
 <pre><code class="language-bash">./scripts/run_local_cluster.sh
 # or: docker compose up --build
 </code></pre>
@@ -3059,6 +3687,12 @@ The script iterates over every store in the config and writes Region metadata vi
 <li>String operations: <code>GET</code>, <code>SET</code>, <code>SET NX/XX</code>, <code>EX/PX/EXAT/PXAT</code>, <code>DEL</code>, <code>MGET</code>, <code>MSET</code>, <code>EXISTS</code></li>
 <li>Integer operations: <code>INCR</code>, <code>DECR</code>, <code>INCRBY</code>, <code>DECRBY</code></li>
 <li>Utility: <code>PING</code>, <code>ECHO</code>, <code>QUIT</code></li>
+</ul>
+<p>TTL option semantics:</p>
+<ul>
+<li><code>EX</code> / <code>PX</code> are relative TTLs.</li>
+<li><code>EXAT</code> / <code>PXAT</code> are absolute expire timestamps.</li>
+<li>The current engine expiry resolution is seconds, so sub-second TTL intent is rounded/coarsened to second granularity.</li>
 </ul>
 <p>In both modes write commands are atomic. The Raft backend batches multi-key updates (<code>MSET</code>, <code>DEL</code>, …) into a single TwoPhaseCommit, matching the embedded semantics. Reads use direct <code>DB.Get</code> locally and leader reads with TTL checks remotely.</p>
 <h2 id="configuration-file"><a class="header" href="#configuration-file">Configuration file</a></h2>

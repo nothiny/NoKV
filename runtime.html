@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>File - NoKV Docs</title>
+        <title>Runtime Call Chains - NoKV Docs</title>
 
 
         <!-- Custom HTML head -->
@@ -178,91 +178,258 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="file-abstractions"><a class="header" href="#file-abstractions">File Abstractions</a></h1>
-<p>The <code>file</code> package encapsulates direct file-system interaction for WAL, SST, and value-log files. It provides portable mmap helpers, allocation primitives, and log file wrappers.</p>
+                        <h1 id="runtime-call-chains-current"><a class="header" href="#runtime-call-chains-current">Runtime Call Chains (Current)</a></h1>
+<p>This document focuses on the current execution paths in NoKV and maps API calls
+to concrete functions in the codebase.</p>
+<p>It intentionally describes only what is running today.</p>
 <hr>
-<h2 id="1-core-types"><a class="header" href="#1-core-types">1. Core Types</a></h2>
+<h2 id="1-api-surface-snapshot"><a class="header" href="#1-api-surface-snapshot">1. API Surface Snapshot</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Type</th><th>Purpose</th><th>Key Methods</th></tr>
+<tr><th>Mode</th><th>Read APIs</th><th>Write APIs</th><th>Txn APIs</th></tr>
 </thead>
 <tbody>
-<tr><td><a href="../file/file.go#L5-L16"><code>Options</code></a></td><td>Parameter bag for opening files (FID, path, size).</td><td>Used by WAL/vlog managers.</td></tr>
-<tr><td><a href="../file/mmap_linux.go#L12-L98"><code>MmapFile</code></a></td><td>Cross-platform mmap wrapper.</td><td><code>OpenMmapFile</code>, <code>AppendBuffer</code>, <code>Truncate</code>, <code>Sync</code>.</td></tr>
-<tr><td><a href="../file/vlog.go#L17-L223"><code>LogFile</code></a></td><td>Value-log specific helper built on <code>MmapFile</code>.</td><td><code>Open</code>, <code>Write</code>, <code>Read</code>, <code>DoneWriting</code>, <code>Truncate</code>, <code>Bootstrap</code>.</td></tr>
+<tr><td>Embedded (<code>NoKV.DB</code>)</td><td><code>Get</code>, <code>NewIterator</code>, <code>NewInternalIterator</code></td><td><code>Set</code>, <code>SetWithTTL</code>, <code>Del</code>, <code>ApplyInternalEntries</code></td><td>N/A (no standalone local txn API)</td></tr>
+<tr><td>Distributed (<code>raftstore/kv</code>)</td><td><code>KvGet</code>, <code>KvBatchGet</code>, <code>KvScan</code></td><td>N/A direct write</td><td><code>KvPrewrite</code>, <code>KvCommit</code>, <code>KvBatchRollback</code>, <code>KvResolveLock</code>, <code>KvCheckTxnStatus</code></td></tr>
 </tbody>
 </table>
 </div>
-<p>Darwin-specific builds live alongside (<code>mmap_darwin.go</code>, <code>sstable_darwin.go</code>) ensuring the package compiles on macOS without manual tuning.</p>
-<hr>
-<h2 id="2-mmap-management"><a class="header" href="#2-mmap-management">2. Mmap Management</a></h2>
+<p>Core entry points:</p>
 <ul>
-<li><code>OpenMmapFile</code> opens or creates a file, optionally extending it to <code>maxSz</code>, then mmaps it. The returned <code>MmapFile</code> exposes <code>Data []byte</code> and the underlying <code>*os.File</code> handle.</li>
-<li>Writes grow the map on demand: <code>AppendBuffer</code> checks if the write would exceed the current mapping and calls <code>Truncate</code> to expand (doubling up to 1 GiB increments).</li>
-<li><code>Sync</code> flushes dirty pages (<code>mmap.Msync</code>), while <code>Delete</code> unmaps, truncates, closes, and removes the file—used when dropping SSTs or value-log segments.</li>
+<li>Embedded DB: <a href="../db.go"><code>db.go</code></a>, <a href="../db_write.go"><code>db_write.go</code></a>, <a href="../iterator.go"><code>iterator.go</code></a></li>
+<li>Distributed RPC: <a href="../raftstore/kv/service.go"><code>raftstore/kv/service.go</code></a></li>
+<li>Raft read/propose bridge: <a href="../raftstore/store/command_service.go"><code>raftstore/store/command_service.go</code></a></li>
+<li>MVCC logic: <a href="../percolator/txn.go"><code>percolator/txn.go</code></a>, <a href="../percolator/reader.go"><code>percolator/reader.go</code></a></li>
 </ul>
-<p>RocksDB relies on custom Env implementations for portability; NoKV keeps the logic in Go, relying on build tags for OS differences.</p>
 <hr>
-<h2 id="3-logfile-semantics"><a class="header" href="#3-logfile-semantics">3. LogFile Semantics</a></h2>
-<p><code>LogFile</code> wraps <code>MmapFile</code> to simplify value-log operations:</p>
-<pre><code class="language-go">lf := &amp;file.LogFile{}
-_ = lf.Open(&amp;file.Options{FID: 1, FileName: "00001.vlog", MaxSz: 1&lt;&lt;29})
-var buf bytes.Buffer
-payload, _ := kv.EncodeEntry(&amp;buf, entry)
-_ = lf.Write(offset, payload)
-_ = lf.DoneWriting(offset + uint32(len(payload)))
-</code></pre>
+<h2 id="2-embedded-write-path-set--setwithttl--del"><a class="header" href="#2-embedded-write-path-set--setwithttl--del">2. Embedded Write Path (<code>Set</code> / <code>SetWithTTL</code> / <code>Del</code>)</a></h2>
+<h3 id="21-function-level-chain"><a class="header" href="#21-function-level-chain">2.1 Function-Level Chain</a></h3>
+<ol>
+<li><code>DB.Set</code> / <code>DB.SetWithTTL</code> / <code>DB.Del</code> creates internal-key entry via <code>kv.NewInternalEntry</code>.</li>
+<li><code>DB.ApplyInternalEntries</code> validates each internal key via <code>kv.SplitInternalKey</code>, then calls <code>batchSet</code>.</li>
+<li><code>batchSet</code> enqueues request (<code>sendToWriteCh</code> -&gt; commit queue).</li>
+<li><code>commitWorker</code> drains a batch:
 <ul>
-<li><code>Open</code> mmaps the file and records current size (guarded to <code>&lt; 4 GiB</code>).</li>
-<li><code>Read</code> validates offsets against both the mmap length and tracked size, preventing partial reads when GC or drop operations shrink the file.</li>
-<li>Entry encoding uses shared helpers in <code>kv</code> (<code>kv.EncodeEntry</code> / <code>kv.EncodeEntryTo</code>); <code>LogFile</code> focuses on write/read/truncate + durability semantics.</li>
-<li><code>DoneWriting</code> guarantees durability for both data bytes <code>[0, offset)</code> and the file metadata (size).
-<ul>
-<li>Sequence: It flushes dirty pages (<code>msync</code>), truncates the file to <code>offset</code>, and performs a file-descriptor level sync (<code>fsync</code>) to ensure the new file size is persisted on disk before returning.</li>
-<li>Contract: Success implies that after a crash, the file size will not exceed <code>offset</code>, and all data prior to <code>offset</code> is safe.</li>
-<li>After syncing, it reinitializes the mmap and keeps the file open in read-write mode for potential subsequent appends (if logic allows) or prepares it for read-only consumption.</li>
+<li><code>vlog.write(requests)</code> writes large values first and produces <code>ValuePtr</code>.</li>
+<li><code>applyRequests</code> -&gt; <code>writeToLSM</code> -&gt; <code>lsm.SetBatch</code>.</li>
 </ul>
 </li>
-<li><code>Rewind</code> (via <code>vlog.Manager.Rewind</code>) leverages <code>LogFile.Truncate</code> and <code>Init</code> to roll back partial batches after errors.</li>
+<li><code>lsm.SetBatch</code> writes one atomic batch:
+<ul>
+<li><code>memTable.setBatch</code></li>
+<li><code>wal.AppendEntryBatch</code></li>
+<li>mem index insert.</li>
 </ul>
+</li>
+</ol>
+<h3 id="22-sequence-diagram"><a class="header" href="#22-sequence-diagram">2.2 Sequence Diagram</a></h3>
+<pre class="mermaid">sequenceDiagram
+    participant U as User API
+    participant DB as DB.Set/SetWithTTL/Del
+    participant Q as commitQueue
+    participant W as commitWorker
+    participant V as vlog.write
+    participant L as lsm.SetBatch
+    participant M as memTable.setBatch
+    participant WAL as wal.AppendEntryBatch
+    U-&gt;&gt;DB: Set/SetWithTTL/Del
+    DB-&gt;&gt;DB: NewInternalEntry + ApplyInternalEntries
+    DB-&gt;&gt;Q: sendToWriteCh / enqueueCommitRequest
+    Q-&gt;&gt;W: nextCommitBatch
+    W-&gt;&gt;V: write(requests)
+    V--&gt;&gt;W: ValuePtr for large values
+    W-&gt;&gt;L: writeToLSM(entries)
+    L-&gt;&gt;M: setBatch(entries)
+    M-&gt;&gt;WAL: AppendEntryBatch(entries)
+    M--&gt;&gt;L: index.Add(...)
+    L--&gt;&gt;W: success
+</pre>
+
 <hr>
-<h2 id="4-sst-helpers"><a class="header" href="#4-sst-helpers">4. SST Helpers</a></h2>
-<p>While SSTable builders/readers live under <code>lsm/table.go</code>, they rely on <code>file</code> helpers to map index/data blocks efficiently. The build tags (<code>sstable_linux.go</code>, <code>sstable_darwin.go</code>) provide OS-specific tuning for direct I/O hints or mmap flags.</p>
+<h2 id="3-embedded-read-path-get--getinternalentry"><a class="header" href="#3-embedded-read-path-get--getinternalentry">3. Embedded Read Path (<code>Get</code> / <code>GetInternalEntry</code>)</a></h2>
+<h3 id="31-function-level-chain"><a class="header" href="#31-function-level-chain">3.1 Function-Level Chain</a></h3>
+<ol>
+<li><code>DB.Get</code> builds <code>InternalKey(CFDefault, userKey, nonTxnMaxVersion)</code>.</li>
+<li><code>loadBorrowedEntry</code> calls <code>lsm.Get</code> for the newest visible internal record.</li>
+<li>If value is pointer (<code>BitValuePointer</code>), read real bytes via <code>vlog.read</code>, clear pointer bit.</li>
+<li><code>PopulateInternalMeta</code> ensures <code>CF/Version</code> cache matches internal key.</li>
+<li><code>DB.Get</code> returns detached public entry via <code>cloneEntry</code> (user key + copied value).</li>
+<li><code>DB.GetInternalEntry</code> returns borrowed internal entry (caller must <code>DecrRef</code>).</li>
+</ol>
+<h3 id="32-sequence-diagram"><a class="header" href="#32-sequence-diagram">3.2 Sequence Diagram</a></h3>
+<pre class="mermaid">sequenceDiagram
+    participant U as User API
+    participant DB as DB.Get/GetInternalEntry
+    participant LSM as lsm.Get
+    participant VLOG as vlog.read
+    U-&gt;&gt;DB: Get(userKey)
+    DB-&gt;&gt;DB: InternalKey(CFDefault,userKey,nonTxnMaxVersion)
+    DB-&gt;&gt;LSM: Get(internalKey)
+    LSM--&gt;&gt;DB: pooled Entry (internal key)
+    alt BitValuePointer set
+        DB-&gt;&gt;VLOG: read(ValuePtr)
+        VLOG--&gt;&gt;DB: raw value bytes
+    end
+    DB-&gt;&gt;DB: PopulateInternalMeta
+    alt Get (public)
+        DB-&gt;&gt;DB: cloneEntry -&gt; user key/value copy
+        DB--&gt;&gt;U: detached Entry
+    else GetInternalEntry
+        DB--&gt;&gt;U: borrowed internal Entry (DecrRef required)
+    end
+</pre>
+
 <hr>
-<h2 id="5-comparison"><a class="header" href="#5-comparison">5. Comparison</a></h2>
+<h2 id="4-iterator-paths"><a class="header" href="#4-iterator-paths">4. Iterator Paths</a></h2>
+<h3 id="41-public-iterator-dbnewiterator"><a class="header" href="#41-public-iterator-dbnewiterator">4.1 Public Iterator (<code>DB.NewIterator</code>)</a></h3>
+<ol>
+<li>Build merged internal iterator: <code>lsm.NewIterators</code> + <code>lsm.NewMergeIterator</code>.</li>
+<li><code>Seek</code> converts user key to internal seek key (<code>CFDefault + nonTxnMaxVersion</code>).</li>
+<li><code>populate/materialize</code>:
+<ul>
+<li>parse internal key (<code>kv.SplitInternalKey</code>)</li>
+<li>apply bounds on user key</li>
+<li>optionally resolve vlog pointer</li>
+<li>expose user-key item.</li>
+</ul>
+</li>
+</ol>
+<h3 id="42-internal-iterator-dbnewinternaliterator"><a class="header" href="#42-internal-iterator-dbnewinternaliterator">4.2 Internal Iterator (<code>DB.NewInternalIterator</code>)</a></h3>
+<ul>
+<li>Directly returns merged iterator over internal keys.</li>
+<li>No user-key rewrite; caller handles <code>kv.SplitInternalKey</code>.</li>
+</ul>
+<pre class="mermaid">flowchart TD
+  A["DB.NewIterator"] --&gt; B["lsm.NewMergeIterator(internal keys)"]
+  B --&gt; C["Seek(userKey -&gt; InternalKey)"]
+  C --&gt; D["populate/materialize"]
+  D --&gt; E["SplitInternalKey + bounds check"]
+  E --&gt; F{"BitValuePointer?"}
+  F -- no --&gt; G["Expose inline value"]
+  F -- yes --&gt; H["vlog.read(ValuePtr)"]
+  H --&gt; G
+  G --&gt; I["Item.Entry uses user key"]
+</pre>
+
+<hr>
+<h2 id="5-distributed-read-path-kvget--kvbatchget--kvscan"><a class="header" href="#5-distributed-read-path-kvget--kvbatchget--kvscan">5. Distributed Read Path (<code>KvGet</code> / <code>KvBatchGet</code> / <code>KvScan</code>)</a></h2>
+<h3 id="51-function-level-chain"><a class="header" href="#51-function-level-chain">5.1 Function-Level Chain</a></h3>
+<ol>
+<li><code>raftstore/kv.Service</code> builds <code>RaftCmdRequest</code> from NoKV RPC.</li>
+<li><code>Store.ReadCommand</code>:
+<ul>
+<li><code>validateCommand</code> (region/epoch/leader/key-range)</li>
+<li><code>peer.LinearizableRead</code></li>
+<li><code>peer.WaitApplied</code></li>
+<li><code>commandApplier(req)</code> (injected as <code>kv.Apply</code>).</li>
+</ul>
+</li>
+<li><code>kv.Apply</code> executes:
+<ul>
+<li><code>handleGet</code> -&gt; <code>percolator.Reader.GetLock</code> + <code>GetValue</code></li>
+<li><code>handleScan</code> -&gt; iterate <code>CFWrite</code>, resolve visible versions.</li>
+</ul>
+</li>
+</ol>
+<h3 id="52-sequence-diagram"><a class="header" href="#52-sequence-diagram">5.2 Sequence Diagram</a></h3>
+<pre class="mermaid">sequenceDiagram
+    participant C as NoKV Client
+    participant SVC as kv.Service
+    participant ST as Store.ReadCommand
+    participant P as peer.LinearizableRead
+    participant AP as kv.Apply
+    participant R as percolator.Reader
+    participant DB as DB
+    C-&gt;&gt;SVC: KvGet/KvBatchGet/KvScan
+    SVC-&gt;&gt;ST: ReadCommand(RaftCmdRequest)
+    ST-&gt;&gt;ST: validateCommand
+    ST-&gt;&gt;P: LinearizableRead + WaitApplied
+    ST-&gt;&gt;AP: commandApplier(req)
+    AP-&gt;&gt;R: GetLock/GetValue or scan CFWrite
+    R-&gt;&gt;DB: GetInternalEntry/NewInternalIterator
+    AP--&gt;&gt;SVC: RaftCmdResponse
+    SVC--&gt;&gt;C: NoKV response
+</pre>
+
+<hr>
+<h2 id="6-distributed-write-path-2pc-via-raft-apply"><a class="header" href="#6-distributed-write-path-2pc-via-raft-apply">6. Distributed Write Path (2PC via Raft Apply)</a></h2>
+<h3 id="61-function-level-chain"><a class="header" href="#61-function-level-chain">6.1 Function-Level Chain</a></h3>
+<ol>
+<li>Client (<code>raftstore/client</code>) runs <code>Mutate</code> / <code>TwoPhaseCommit</code> by region.</li>
+<li>RPC layer (<code>kv.Service</code>) sends write commands through <code>Store.ProposeCommand</code>.</li>
+<li>Raft replication commits log entries; apply path invokes <code>kv.Apply</code>.</li>
+<li><code>kv.Apply</code> dispatches to <code>percolator.Prewrite/Commit/BatchRollback/ResolveLock/CheckTxnStatus</code>.</li>
+<li>Percolator mutators call <code>applyVersionedOps</code>:
+<ul>
+<li>build entries via <code>kv.NewInternalEntry</code></li>
+<li>call <code>db.ApplyInternalEntries</code></li>
+<li>release refs (<code>DecrRef</code>).</li>
+</ul>
+</li>
+<li>Storage then follows the same embedded write pipeline (vlog -&gt; LSM/WAL).</li>
+</ol>
+<h3 id="62-sequence-diagram"><a class="header" href="#62-sequence-diagram">6.2 Sequence Diagram</a></h3>
+<pre class="mermaid">sequenceDiagram
+    participant CL as raftstore/client
+    participant SVC as kv.Service
+    participant ST as Store.ProposeCommand
+    participant RF as Raft replicate/apply
+    participant AP as kv.Apply
+    participant TXN as percolator.txn
+    participant DB as DB.ApplyInternalEntries
+    CL-&gt;&gt;SVC: KvPrewrite/KvCommit/...
+    SVC-&gt;&gt;ST: ProposeCommand
+    ST-&gt;&gt;RF: route to leader + replicate
+    RF-&gt;&gt;AP: apply committed command
+    AP-&gt;&gt;TXN: Prewrite/Commit/Resolve...
+    TXN-&gt;&gt;DB: applyVersionedOps -&gt; ApplyInternalEntries
+    DB--&gt;&gt;TXN: write result
+    AP--&gt;&gt;SVC: RaftCmdResponse
+    SVC--&gt;&gt;CL: NoKV response
+</pre>
+
+<hr>
+<h2 id="7-entry-ownership-and-refcount-rules"><a class="header" href="#7-entry-ownership-and-refcount-rules">7. Entry Ownership and Refcount Rules</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Engine</th><th>Approach</th></tr>
+<tr><th>Source</th><th>Returned entry type</th><th>Key form</th><th>Caller action</th></tr>
 </thead>
 <tbody>
-<tr><td>RocksDB</td><td>C++ Env &amp; random-access file wrappers.</td></tr>
-<tr><td>Badger</td><td><code>y.File</code> abstraction with mmap.</td></tr>
-<tr><td>NoKV</td><td>Go-native mmap wrappers with explicit log helpers.</td></tr>
+<tr><td><code>DB.GetInternalEntry</code></td><td>Borrowed pooled</td><td>Internal key</td><td>Must call <code>DecrRef()</code> once</td></tr>
+<tr><td><code>DB.Get</code></td><td>Detached copy</td><td>User key</td><td>Must not call <code>DecrRef()</code></td></tr>
+<tr><td><code>percolator.applyVersionedOps</code> temporary entries</td><td>Borrowed pooled</td><td>Internal key</td><td>Always <code>DecrRef()</code> after <code>ApplyInternalEntries</code></td></tr>
+<tr><td><code>LSM.Get</code> / memtable reads</td><td>Borrowed pooled</td><td>Internal key</td><td>Upstream owner must release</td></tr>
 </tbody>
 </table>
 </div>
-<p>By keeping all filesystem primitives in one package, NoKV ensures WAL, vlog, and SST layers share consistent behaviour (sync semantics, truncation rules) and simplifies testing (<code>file/mmap_linux_test.go</code>).</p>
 <hr>
-<h2 id="6-operational-notes"><a class="header" href="#6-operational-notes">6. Operational Notes</a></h2>
-<ul>
-<li><code>DoneWriting</code> provides strong crash-consistency guarantees. Even on filesystems where <code>ftruncate</code> metadata persistence is asynchronous, the explicit post-truncate <code>fsync</code> ensures the file size is durable upon success.</li>
-<li>Value-log and WAL segments rely on <code>DoneWriting</code>/<code>Truncate</code> to seal files; avoid manipulating files externally or mmap metadata may desynchronise.</li>
-<li><code>LogFile</code> updates cached size internally on <code>Write</code>/<code>Truncate</code>, so read bounds stay consistent during rewrite/rewind flows.</li>
-<li><code>vfs.SyncDir</code> is used by strict durability flows to persist directory entry changes (create/rename/remove). For example, strict SST flush calls <code>SyncDir(workdir)</code> before manifest publication.</li>
-</ul>
-<p>For more on how these primitives plug into higher layers, see <a href="wal.html"><code>docs/wal.md</code></a> and <a href="vlog.html"><code>docs/vlog.md</code></a>.</p>
+<h2 id="8-keyvalue-shape-by-stage"><a class="header" href="#8-keyvalue-shape-by-stage">8. Key/Value Shape by Stage</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Stage</th><th><code>Entry.Key</code></th><th><code>Entry.Value</code></th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td>User write before queue</td><td>Internal key (<code>CF + user key + ts</code>)</td><td>Raw user bytes</td><td>Built by <code>NewInternalEntry</code></td></tr>
+<tr><td>After vlog step</td><td>Internal key</td><td>Inline value or <code>ValuePtr.Encode()</code></td><td>Pointer marked by <code>BitValuePointer</code></td></tr>
+<tr><td>LSM/WAL stored form</td><td>Internal key</td><td>Encoded value payload</td><td>Used by replay/flush/compaction</td></tr>
+<tr><td><code>GetInternalEntry</code> output</td><td>Internal key</td><td>Raw value bytes (pointer resolved)</td><td>Internal caller view</td></tr>
+<tr><td><code>Get</code> / public iterator output</td><td>User key</td><td>Raw value bytes</td><td>External caller view</td></tr>
+</tbody>
+</table>
+</div>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="vfs.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="architecture.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="cache.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="errors.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -272,11 +439,11 @@ _ = lf.DoneWriting(offset + uint32(len(payload)))
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="vfs.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="architecture.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="cache.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="errors.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>
