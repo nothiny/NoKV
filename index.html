@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-bdaabb40.js";
+            window.path_to_searchindex_js = "searchindex-6fdcf697.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-5ff2b812.js"></script>
@@ -256,7 +256,7 @@
 <h3 style="margin-top: 0;">🧠 Smart Caching</h3>
 
     
-<p>Built-in <strong>W-TinyLFU</strong> Block Cache (via Ristretto) and <strong>HotRing</strong> implementation ensure 99% cache hit rates and adapt to skew access patterns.</p>
+<p>Built-in <strong>Ristretto</strong> block cache plus byte-budgeted index/bloom caches and <strong>HotRing</strong> keep hot working sets close to the read path.</p>
 
   </div>
 
@@ -283,35 +283,15 @@
 </div>
 
 <br>
-<h2 id="-performance-benchmark"><a class="header" href="#-performance-benchmark">📊 Performance Benchmark</a></h2>
-<p>Latest full baseline (generated on 2026-02-23 with default <code>make bench</code> profile: records=1M, ops=1M, conc=16, value_size=256, workloads A-G, engines NoKV/Badger/Pebble):</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th style="text-align: left">Workload</th><th style="text-align: right">NoKV (ops/s)</th><th style="text-align: right">Badger (ops/s)</th><th style="text-align: right">Pebble (ops/s)</th></tr>
-</thead>
-<tbody>
-<tr><td style="text-align: left">YCSB-A</td><td style="text-align: right">847,660</td><td style="text-align: right">396,314</td><td style="text-align: right">1,282,218</td></tr>
-<tr><td style="text-align: left">YCSB-B</td><td style="text-align: right">1,742,820</td><td style="text-align: right">716,151</td><td style="text-align: right">1,941,330</td></tr>
-<tr><td style="text-align: left">YCSB-C</td><td style="text-align: right">2,070,856</td><td style="text-align: right">826,766</td><td style="text-align: right">847,764</td></tr>
-<tr><td style="text-align: left">YCSB-D</td><td style="text-align: right">1,754,955</td><td style="text-align: right">842,637</td><td style="text-align: right">2,509,809</td></tr>
-<tr><td style="text-align: left">YCSB-E</td><td style="text-align: right">205,489</td><td style="text-align: right">41,508</td><td style="text-align: right">554,557</td></tr>
-<tr><td style="text-align: left">YCSB-F</td><td style="text-align: right">715,946</td><td style="text-align: right">326,343</td><td style="text-align: right">1,123,473</td></tr>
-<tr><td style="text-align: left">YCSB-G</td><td style="text-align: right">413,521</td><td style="text-align: right">399,405</td><td style="text-align: right">583,584</td></tr>
-</tbody>
-</table>
-</div>
-<details>
-<summary><em>Click to view full benchmark summary</em></summary>
-<pre><code class="language-text">NoKV    YCSB-A 847660   YCSB-B 1742820  YCSB-C 2070856  YCSB-D 1754955  YCSB-E 205489  YCSB-F 715946  YCSB-G 413521
-Badger  YCSB-A 396314   YCSB-B 716151   YCSB-C 826766   YCSB-D 842637   YCSB-E 41508   YCSB-F 326343  YCSB-G 399405
-Pebble  YCSB-A 1282218  YCSB-B 1941330  YCSB-C 847764   YCSB-D 2509809  YCSB-E 554557  YCSB-F 1123473 YCSB-G 583584
-</code></pre>
-</details>
-<p>Raw report: <a href="https://github.com/feichai0017/NoKV/blob/main/benchmark/benchmark_results/benchmark_results_20260223_195951.txt">benchmark_results_20260223_195951.txt</a></p>
+<p>Benchmark methodology and result snapshots are maintained only in:
+<a href="../benchmark/README.html"><code>../benchmark/README.md</code></a></p>
 <br>
 <h2 id="-architecture"><a class="header" href="#-architecture">🏗️ Architecture</a></h2>
-<pre class="mermaid">graph TD
+<pre class="mermaid">%%{init: {
+  "themeVariables": { "fontSize": "20px" },
+  "flowchart": { "nodeSpacing": 55, "rankSpacing": 75, "curve": "basis" }
+}}%%
+graph TD
     Client["Client / Redis"] --&gt;|RESP Protocol| Gateway["Redis Gateway"]
     Gateway --&gt;|RaftCmd| RaftStore
     
@@ -330,7 +310,7 @@ Pebble  YCSB-A 1282218  YCSB-B 1941330  YCSB-C 847764   YCSB-D 2509809  YCSB-E 5
     
     subgraph "Cache Layer"
         BlockCache["Block Cache (Ristretto)"] -.-&gt; SSTable
-        IndexCache["Index Cache (W-TinyLFU)"] -.-&gt; SSTable
+        IndexCache["Index Cache (W-TinyLFU, byte budget)"] -.-&gt; SSTable
     end
 </pre>
 

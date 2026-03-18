@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-bdaabb40.js";
+            window.path_to_searchindex_js = "searchindex-6fdcf697.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-5ff2b812.js"></script>
@@ -190,6 +190,7 @@
 <p>This launches a 3-node Raft cluster plus a PD-lite service.</p>
 <pre><code class="language-bash">./scripts/run_local_cluster.sh --config ./raft_config.example.json
 </code></pre>
+<p>The launcher stays attached, streams PD/store logs to the terminal, and also writes them under <code>./artifacts/cluster/</code>.</p>
 <p>Start the Redis-compatible gateway in another shell:</p>
 <pre><code class="language-bash">go run ./cmd/nokv-redis --addr 127.0.0.1:6380 --raft-config raft_config.example.json
 </code></pre>
@@ -241,7 +242,7 @@ func main() {
 <ul>
 <li><code>DB.Get</code> returns detached entries (do not call <code>DecrRef</code>).</li>
 <li><code>DB.GetInternalEntry</code> returns borrowed entries and callers must call <code>DecrRef</code> exactly once.</li>
-<li><code>DB.SetWithTTL</code> accepts <code>time.Duration</code> (relative TTL). <code>DB.Set</code>/<code>DB.SetWithTTL</code> reject <code>nil</code> values; use <code>DB.Del</code> for deletes.</li>
+<li><code>DB.SetWithTTL</code> accepts <code>time.Duration</code> (relative TTL). <code>DB.Set</code>/<code>DB.SetBatch</code>/<code>DB.SetWithTTL</code> reject <code>nil</code> values; use <code>DB.Del</code> or <code>DB.DeleteRange(start,end)</code> for deletes.</li>
 <li><code>DB.NewIterator</code> exposes user-facing entries, while <code>DB.NewInternalIterator</code> scans raw internal keys (<code>cf+user_key+ts</code>).</li>
 </ul>
 </blockquote>
@@ -249,29 +250,14 @@ func main() {
 <p>Micro benchmarks:</p>
 <pre><code class="language-bash">go test -bench=. -run=^$ ./...
 </code></pre>
-<p>YCSB (default: NoKV + Badger + Pebble, workloads A-G):</p>
+<p>YCSB (default: NoKV + Badger + Pebble, workloads A-F):</p>
 <pre><code class="language-bash">make bench
 </code></pre>
 <p>Override defaults with env vars:</p>
 <pre><code class="language-bash">YCSB_RECORDS=1000000 YCSB_OPS=1000000 YCSB_CONC=8 make bench
 </code></pre>
-<p>Latest full baseline (2026-02-23):</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th style="text-align: left">Workload</th><th style="text-align: right">NoKV (ops/s)</th><th style="text-align: right">Badger (ops/s)</th><th style="text-align: right">Pebble (ops/s)</th></tr>
-</thead>
-<tbody>
-<tr><td style="text-align: left">YCSB-A</td><td style="text-align: right">847,660</td><td style="text-align: right">396,314</td><td style="text-align: right">1,282,218</td></tr>
-<tr><td style="text-align: left">YCSB-B</td><td style="text-align: right">1,742,820</td><td style="text-align: right">716,151</td><td style="text-align: right">1,941,330</td></tr>
-<tr><td style="text-align: left">YCSB-C</td><td style="text-align: right">2,070,856</td><td style="text-align: right">826,766</td><td style="text-align: right">847,764</td></tr>
-<tr><td style="text-align: left">YCSB-D</td><td style="text-align: right">1,754,955</td><td style="text-align: right">842,637</td><td style="text-align: right">2,509,809</td></tr>
-<tr><td style="text-align: left">YCSB-E</td><td style="text-align: right">205,489</td><td style="text-align: right">41,508</td><td style="text-align: right">554,557</td></tr>
-<tr><td style="text-align: left">YCSB-F</td><td style="text-align: right">715,946</td><td style="text-align: right">326,343</td><td style="text-align: right">1,123,473</td></tr>
-<tr><td style="text-align: left">YCSB-G</td><td style="text-align: right">413,521</td><td style="text-align: right">399,405</td><td style="text-align: right">583,584</td></tr>
-</tbody>
-</table>
-</div>
+<p>Detailed benchmark methodology and latest result snapshots are maintained in:
+<a href="../benchmark/README.html"><code>benchmark/README.md</code></a>.</p>
 <h2 id="cleanup"><a class="header" href="#cleanup">Cleanup</a></h2>
 <p>If a local run crashes or you want a clean slate:</p>
 <pre><code class="language-bash">make clean
