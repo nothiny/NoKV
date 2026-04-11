@@ -8,7 +8,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="">
+        <meta name="description" content="NoKV design, architecture, migration, and testing documentation.">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="docs/custom-7218a61a.css">
+        <link rel="stylesheet" href="docs/custom-a69f6233.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6fdcf697.js";
+            window.path_to_searchindex_js = "searchindex-01a1bb3c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-5ff2b812.js"></script>
+        <script src="toc-b8f8ac3b.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -180,9 +180,18 @@
                     <main>
                         <h1 id="nokv-architecture-overview"><a class="header" href="#nokv-architecture-overview">NoKV Architecture Overview</a></h1>
 <p>NoKV delivers a hybrid storage engine that can operate as a standalone embedded KV store or as a distributed NoKV service. The distributed RPC surface follows a TinyKV/TiKV-style region + MVCC design, but the service identity and deployment model are NoKV’s own. This document captures the key building blocks, how they interact, and the execution flow from client to disk.</p>
+<blockquote>
+<p>Read this page if you want the shortest route from “what is NoKV” to “which package owns which part of the system”.</p>
+</blockquote>
+<h2 id="reader-map"><a class="header" href="#reader-map">Reader Map</a></h2>
+<ul>
+<li>If you care about the embedded engine, focus on sections 2 and 5.</li>
+<li>If you care about distributed runtime ownership, focus on sections 3, 4, and 5.</li>
+<li>If you care about migration and recovery, read this page together with <a href="migration.html"><code>migration.md</code></a> and <a href="recovery.html"><code>recovery.md</code></a>.</li>
+</ul>
 <hr>
 <h2 id="1-high-level-layout"><a class="header" href="#1-high-level-layout">1. High-Level Layout</a></h2>
-<pre><code>┌─────────────────────────┐   NoKV gRPC   ┌─────────────────────────┐
+<pre><code>┌─────────────────────────┐   NoKV gRPC     ┌─────────────────────────┐
 │ raftstore Service       │◀──────────────▶ │ raftstore/client        │
 └───────────┬─────────────┘                 │  (Get / Scan / Mutate)  │
             │                               └─────────────────────────┘
@@ -215,15 +224,59 @@
 <ul>
 <li><strong>Embedded mode</strong> uses <code>NoKV.Open</code> directly: WAL→MemTable→SST durability, ValueLog separation, non-transactional APIs with internal version ordering, and rich stats.</li>
 <li><strong>Distributed mode</strong> layers <code>raftstore</code> on top: multi-Raft regions reuse the same WAL, keep store-local recovery metadata separate from storage manifest state, expose metrics, and serve NoKV RPCs.</li>
-<li><strong>Control plane split</strong>: <code>raft_config</code> provides bootstrap topology; PD provides runtime routing/TSO/control-plane state in cluster mode.</li>
+<li><strong>Control plane split</strong>: <code>raft_config</code> provides bootstrap topology; Coordinator provides runtime routing/TSO/control-plane state in cluster mode.</li>
 <li><strong>Clients</strong> obtain leader-aware routing, automatic NotLeader/EpochNotMatch retries, and two-phase commit helpers.</li>
 </ul>
+<h3 id="same-system-two-shapes"><a class="header" href="#same-system-two-shapes">Same system, two shapes</a></h3>
+<pre class="mermaid">flowchart LR
+    App["App / CLI / Redis client"]
+    App --&gt; Embedded["Embedded NoKV DB"]
+    App --&gt; RPC["NoKV RPC / raftstore/client"]
+
+    subgraph "Standalone shape"
+        Embedded --&gt; Core["WAL + LSM + VLog + MVCC"]
+    end
+
+    subgraph "Distributed shape"
+        RPC --&gt; Server["server.Node"]
+        Server --&gt; Store["store.Store"]
+        Store --&gt; Peer["peer.Peer"]
+        Peer --&gt; Core
+        Store --&gt; Coordinator["Coordinator"]
+    end
+
+    Embedded -. migrate init / seed .-&gt; Store
+</pre>
+
 <h3 id="detailed-runtime-paths"><a class="header" href="#detailed-runtime-paths">Detailed Runtime Paths</a></h3>
 <p>For function-level call chains with sequence diagrams (embedded write/read,
 iterator scan, distributed read/write via Raft apply), see
 <a href="runtime.html"><code>docs/runtime.md</code></a>.</p>
 <hr>
 <h2 id="2-embedded-engine"><a class="header" href="#2-embedded-engine">2. Embedded Engine</a></h2>
+<h3 id="code-entry-points"><a class="header" href="#code-entry-points">Code entry points</a></h3>
+<p>If you want to inspect the embedded side first, start here:</p>
+<pre><code class="language-go">opt := NoKV.NewDefaultOptions()
+opt.WorkDir = "./workdir"
+
+db, err := NoKV.Open(opt)
+if err != nil {
+    panic(err)
+}
+defer db.Close()
+
+_ = db.Set([]byte("hello"), []byte("world"))
+entry, _ := db.Get([]byte("hello"))
+fmt.Println(string(entry.Value))
+</code></pre>
+<p>Then read:</p>
+<ul>
+<li><code>db.go</code></li>
+<li><code>db_write.go</code></li>
+<li><code>lsm/</code></li>
+<li><code>wal/</code></li>
+<li><code>vlog.go</code></li>
+</ul>
 <h3 id="21-wal--memtable"><a class="header" href="#21-wal--memtable">2.1 WAL &amp; MemTable</a></h3>
 <ul>
 <li><code>wal.Manager</code> appends <code>[len|type|payload|crc]</code> records (typed WAL), rotates segments, and replays logs on crash.</li>
@@ -237,22 +290,22 @@ iterator scan, distributed read/write via Raft apply), see
 </ul>
 <h3 id="23-manifest"><a class="header" href="#23-manifest">2.3 Manifest</a></h3>
 <ul>
-<li><code>manifest.Manager</code> stores only storage-engine metadata: SST metadata, WAL checkpoints, and ValueLog metadata. Store-local raft replay pointers live in <code>raftstore/meta</code>.</li>
+<li><code>manifest.Manager</code> stores only storage-engine metadata: SST metadata, WAL checkpoints, and ValueLog metadata. Store-local raft replay pointers live in <code>raftstore/localmeta</code>.</li>
 <li><code>CURRENT</code> provides crash-safe pointer updates for storage-engine metadata. Region descriptors are no longer stored in the storage manifest.</li>
 </ul>
 <h3 id="24-lsm-compaction--ingest-buffer"><a class="header" href="#24-lsm-compaction--ingest-buffer">2.4 LSM Compaction &amp; Ingest Buffer</a></h3>
 <ul>
-<li><code>compact.Manager</code> drives compaction cycles; <code>lsm.levelManager</code> supplies table metadata and executes the plan.</li>
-<li>Planning is split: <code>compact.PlanFor*</code> selects table IDs + key ranges, then LSM resolves IDs back to tables and runs the merge.</li>
-<li><code>compact.State</code> guards overlapping key ranges and tracks in-flight table IDs.</li>
-<li>Ingest shard selection is policy-driven in <code>compact</code> (<code>PickShardOrder</code> / <code>PickShardByBacklog</code>) while the ingest buffer remains in <code>lsm</code>.</li>
+<li><code>lsm.compaction</code> drives compaction cycles; <code>lsm.levelManager</code> supplies table metadata and executes the plan.</li>
+<li>Planning is split inside <code>lsm</code>: <code>PlanFor*</code> selects table IDs + key ranges, then LSM resolves IDs back to tables and runs the merge.</li>
+<li><code>lsm.State</code> guards overlapping key ranges and tracks in-flight table IDs.</li>
+<li>Ingest shard selection is policy-driven in <code>lsm</code> (<code>PickShardOrder</code> / <code>PickShardByBacklog</code>) while the ingest buffer remains in <code>lsm</code>.</li>
 </ul>
 <pre class="mermaid">flowchart TD
-  Manager["compact.Manager"] --&gt; LSM["lsm.levelManager"]
-  LSM --&gt;|TableMeta snapshot| Planner["compact.PlanFor*"]
-  Planner --&gt; Plan["compact.Plan (fid+range)"]
+  Manager["lsm.compaction"] --&gt; LSM["lsm.levelManager"]
+  LSM --&gt;|TableMeta snapshot| Planner["PlanFor*"]
+  Planner --&gt; Plan["lsm.Plan (fid+range)"]
   Plan --&gt;|resolvePlanLocked| Exec["LSM executor"]
-  Exec --&gt; State["compact.State guard"]
+  Exec --&gt; State["lsm.State guard"]
   Exec --&gt; Build["subcompact/build SST"]
   Build --&gt; Manifest["manifest edits"]
   L0["L0 tables"] --&gt;|moveToIngest| Ingest["ingest buffer shards"]
@@ -263,14 +316,14 @@ iterator scan, distributed read/write via Raft apply), see
 <h3 id="25-distributed-transaction-path"><a class="header" href="#25-distributed-transaction-path">2.5 Distributed Transaction Path</a></h3>
 <ul>
 <li><code>percolator</code> implements Prewrite/Commit/ResolveLock/CheckTxnStatus; <code>kv.Apply</code> dispatches raft commands to these helpers.</li>
-<li>MVCC timestamps come from the distributed client/PD TSO flow, not from an embedded standalone transaction API.</li>
+<li>MVCC timestamps come from the distributed client/Coordinator TSO flow, not from an embedded standalone transaction API.</li>
 <li>Watermarks (<code>utils.WaterMark</code>) are used in durability/visibility coordination; they have no background goroutine and advance via mutex + atomics.</li>
 </ul>
 <h3 id="26-write-pipeline--backpressure"><a class="header" href="#26-write-pipeline--backpressure">2.6 Write Pipeline &amp; Backpressure</a></h3>
 <ul>
 <li>Writes enqueue into a commit queue (<code>db_write.go</code>) where requests are coalesced into batches before a commit worker drains them.</li>
 <li>The commit worker always writes the value log first (when needed), then applies WAL/LSM updates; <code>SyncWrites</code> adds a WAL fsync step.</li>
-<li>Batch sizing adapts to backlog (<code>WriteBatchMaxCount/Size</code>, <code>WriteBatchWait</code>) and hot-key pressure can expand batch limits temporarily to drain spikes.</li>
+<li>Batch sizing adapts to backlog through <code>WriteBatchMaxCount</code>, <code>WriteBatchMaxSize</code>, and <code>WriteBatchWait</code>.</li>
 <li>Backpressure is enforced in two places: LSM throttling toggles <code>db.blockWrites</code> when L0 backlog grows, and HotRing can reject hot keys via <code>WriteHotKeyLimit</code>.</li>
 </ul>
 <h3 id="27-ref-count-lifecycle-contracts"><a class="header" href="#27-ref-count-lifecycle-contracts">2.7 Ref-Count Lifecycle Contracts</a></h3>
@@ -292,31 +345,52 @@ iterator scan, distributed read/write via Raft apply), see
 </div>
 <hr>
 <h2 id="3-replication-layer-raftstore"><a class="header" href="#3-replication-layer-raftstore">3. Replication Layer (raftstore)</a></h2>
+<h3 id="code-entry-points-1"><a class="header" href="#code-entry-points-1">Code entry points</a></h3>
+<p>If you want to inspect the distributed side first, start here:</p>
+<pre><code class="language-go">srv, err := server.NewNode(server.Config{
+    Storage: server.Storage{MVCC: db, Raft: db.RaftLog()},
+    Store: store.Config{StoreID: 1},
+    Raft: myraft.Config{ElectionTick: 10, HeartbeatTick: 2, PreVote: true},
+    TransportAddr: "127.0.0.1:20160",
+})
+if err != nil {
+    panic(err)
+}
+defer srv.Close()
+</code></pre>
+<p>Then read:</p>
+<ul>
+<li><code>raftstore/server/node.go</code></li>
+<li><code>raftstore/store/store.go</code></li>
+<li><code>raftstore/peer/peer.go</code></li>
+<li><code>raftstore/engine/wal_storage.go</code></li>
+<li><code>raftstore/localmeta/store.go</code></li>
+</ul>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Package</th><th>Responsibility</th></tr>
 </thead>
 <tbody>
-<tr><td><a href="../raftstore/store"><code>store</code></a></td><td>Region catalog, router, RegionMetrics, Region hooks, manifest integration, helpers such as <code>StartPeer</code> / <code>SplitRegion</code>.</td></tr>
+<tr><td><a href="../raftstore/store"><code>store</code></a></td><td>Region catalog/runtime root, router, RegionMetrics, scheduler + command runtimes, helpers such as <code>StartPeer</code> / <code>SplitRegion</code>.</td></tr>
 <tr><td><a href="../raftstore/peer"><code>peer</code></a></td><td>Wraps etcd/raft <code>RawNode</code>, handles Ready pipeline, snapshot resend queue, backlog instrumentation.</td></tr>
 <tr><td><a href="../raftstore/engine"><code>engine</code></a></td><td>WALStorage/DiskStorage/MemoryStorage, reusing the DB’s WAL while keeping store-local raft replay metadata in sync.</td></tr>
 <tr><td><a href="../raftstore/transport"><code>transport</code></a></td><td>gRPC transport for Raft Step messages, connection management, retries/blocks/TLS. Also acts as the host for NoKV RPC.</td></tr>
 <tr><td><a href="../raftstore/kv"><code>kv</code></a></td><td>NoKV RPC handler plus <code>kv.Apply</code> bridging Raft commands to MVCC logic.</td></tr>
-<tr><td><a href="../raftstore/server"><code>server</code></a></td><td><code>ServerConfig</code> + <code>New</code> combine DB, Store, transport, and NoKV service into a reusable node instance.</td></tr>
+<tr><td><a href="../raftstore/server"><code>server</code></a></td><td><code>Config</code> + <code>NewNode</code> combine DB, Store, transport, and NoKV service into a reusable node instance.</td></tr>
 </tbody>
 </table>
 </div>
 <h3 id="31-bootstrap-sequence"><a class="header" href="#31-bootstrap-sequence">3.1 Bootstrap Sequence</a></h3>
 <ol>
-<li><code>server.New</code> wires DB, store configuration (StoreID, hooks, scheduler), Raft config, and transport address. It registers NoKV RPC on the shared gRPC server and sets <code>transport.SetHandler(store.Step)</code>.</li>
+<li><code>server.NewNode</code> wires DB, store configuration (StoreID, hooks, scheduler), Raft config, and transport address. It registers NoKV RPC on the shared gRPC server and sets <code>transport.SetHandler(store.Step)</code>.</li>
 <li>CLI (<code>nokv serve</code>) or application enumerates the local peer catalog and calls <code>Store.StartPeer</code> for every Region containing the local store:
 <ul>
-<li><code>peer.Config</code> includes Raft params, transport, <code>kv.NewEntryApplier</code>, WAL/Manifest handles, Region metadata.</li>
+<li><code>peer.Config</code> includes Raft params, transport, <code>kv.NewEntryApplier</code>, peer storage, and Region metadata.</li>
 <li>Router registration, regionManager bookkeeping, optional <code>Peer.Bootstrap</code> with initial peer list, leader campaign.</li>
 </ul>
 </li>
-<li>Peers from other stores can be configured through <code>transport.SetPeer(peerID, addr)</code> (raft peer ID). In cluster mode, runtime routing/control-plane decisions come from PD.</li>
+<li>Peers from other stores can be configured through <code>transport.SetPeer(peerID, addr)</code> (raft peer ID). In cluster mode, runtime routing/control-plane decisions come from Coordinator.</li>
 </ol>
 <h3 id="32-command-paths"><a class="header" href="#32-command-paths">3.2 Command Paths</a></h3>
 <ul>
@@ -346,29 +420,29 @@ iterator scan, distributed read/write via Raft apply), see
 </tbody>
 </table>
 </div>
-<p><code>nokv serve</code> is the CLI entry point—open the DB, construct <code>raftstore.Server</code>, register peers, start local Raft peers, and display a local peer catalog summary (Regions, key ranges, peers). <code>scripts/run_local_cluster.sh</code> builds the CLI, writes a minimal local peer catalog, launches multiple <code>nokv serve</code> processes on localhost, and handles cleanup on Ctrl+C.</p>
+<p><code>nokv serve</code> is the CLI entry point—open the DB, construct <code>server.Node</code>, register peers, start local Raft peers, and display a local peer catalog summary (Regions, key ranges, peers). <code>scripts/dev/cluster.sh</code> builds the CLI, writes a minimal local peer catalog, launches multiple <code>nokv serve</code> processes on localhost, and handles cleanup on Ctrl+C.</p>
 <p>The RPC request/response shape is intentionally close to TinyKV/TiKV so the MVCC and region semantics remain familiar, but the service name exposed on the wire is <code>pb.NoKV</code>.</p>
 <hr>
 <h2 id="5-client-workflow"><a class="header" href="#5-client-workflow">5. Client Workflow</a></h2>
 <p><code>raftstore/client</code> offers a leader-aware client with retry logic and convenient helpers:</p>
 <ul>
-<li><strong>Initialization</strong>: provide <code>[]StoreEndpoint</code> + <code>RegionResolver</code> (<code>GetRegionByKey</code>) so runtime routing is PD-driven.</li>
+<li><strong>Initialization</strong>: provide <code>[]StoreEndpoint</code> + <code>RegionResolver</code> (<code>GetRegionByKey</code>) so runtime routing is Coordinator-driven.</li>
 <li><strong>Reads</strong>: <code>Get</code> and <code>Scan</code> pick the leader store for a key range, issue NoKV RPCs, and retry on NotLeader/EpochNotMatch.</li>
 <li><strong>Writes</strong>: <code>Mutate</code> bundles operations per region and drives Prewrite/Commit (primary first, secondaries after); <code>Put</code> and <code>Delete</code> are convenience wrappers using the same 2PC path.</li>
-<li><strong>Timestamps</strong>: clients must supply <code>startVersion</code>/<code>commitVersion</code>. For distributed demos, use PD-lite (<code>nokv pd</code>) to obtain globally increasing values before calling <code>TwoPhaseCommit</code>.</li>
-<li><strong>Bootstrap helpers</strong>: <code>scripts/run_local_cluster.sh --config raft_config.example.json</code> builds the binaries, seeds local peer catalogs via <code>nokv-config manifest</code>, launches PD-lite, and starts the stores declared in the config.</li>
+<li><strong>Timestamps</strong>: clients must supply <code>startVersion</code>/<code>commitVersion</code>. For distributed demos, use Coordinator (<code>nokv coordinator</code>) to obtain globally increasing values before calling <code>TwoPhaseCommit</code>.</li>
+<li><strong>Bootstrap helpers</strong>: <code>scripts/dev/cluster.sh --config raft_config.example.json</code> builds the binaries, seeds local peer catalogs via <code>nokv-config catalog</code>, launches Coordinator, and starts the stores declared in the config.</li>
 </ul>
 <p><strong>Example (two regions)</strong></p>
 <ol>
 <li>Regions <code>[a,m)</code> and <code>[m,+∞)</code>, each led by a different store.</li>
 <li><code>Mutate(ctx, primary="alfa", mutations, startTs, commitTs, ttl)</code> prewrites and commits across the relevant regions.</li>
 <li><code>Get/Scan</code> retries automatically if the leader changes.</li>
-<li>See <code>raftstore/server/server_test.go</code> for a full end-to-end example using real <code>raftstore.Server</code> instances.</li>
+<li>See <code>raftstore/server/node_test.go</code> for a full end-to-end example using real <code>server.Node</code> instances.</li>
 </ol>
 <hr>
 <h2 id="6-failure-handling"><a class="header" href="#6-failure-handling">6. Failure Handling</a></h2>
 <ul>
-<li>Manifest edits capture only storage metadata, WAL checkpoints, and ValueLog pointers. Store-local region recovery state and raft replay pointers are loaded from <code>raftstore/meta</code>.</li>
+<li>Manifest edits capture only storage metadata, WAL checkpoints, and ValueLog pointers. Store-local region recovery state and raft replay pointers are loaded from <code>raftstore/localmeta</code>.</li>
 <li>WAL replay reconstructs memtables and Raft groups; ValueLog recovery trims partial records.</li>
 <li><code>Stats.StartStats</code> resumes metrics sampling immediately after restart, making it easy to verify recovery correctness via <code>nokv stats</code>.</li>
 </ul>
@@ -378,10 +452,10 @@ iterator scan, distributed read/write via Raft apply), see
 <li><code>StatsSnapshot</code> publishes flush/compaction/WAL/VLog/raft/region/hot/cache metrics. <code>nokv stats</code> and the expvar endpoint expose the same data.</li>
 <li><code>nokv regions</code> inspects the local peer catalog.</li>
 <li><code>nokv serve</code> advertises Region samples on startup (ID, key range, peers) for quick verification.</li>
-<li>Inspect scheduler/control-plane state via PD APIs/metrics.</li>
+<li>Inspect scheduler/control-plane state via Coordinator APIs/metrics.</li>
 <li>Scripts:
 <ul>
-<li><code>scripts/run_local_cluster.sh</code> – launch a multi-node NoKV cluster locally.</li>
+<li><code>scripts/dev/cluster.sh</code> – launch a multi-node NoKV cluster locally.</li>
 <li><code>RECOVERY_TRACE_METRICS=1 go test ./... -run 'TestRecovery(RemovesStaleValueLogSegment|CleansMissingSSTFromManifest|ManifestRewriteCrash|SlowFollowerSnapshotBacklog|SnapshotExportRoundTrip|WALReplayRestoresData)' -count=1 -v</code> – crash-recovery validation.</li>
 <li><code>CHAOS_TRACE_METRICS=1 go test -run 'TestGRPCTransport(HandlesPartition|MetricsWatchdog|MetricsBlockedPeers)' -count=1 -v ./raftstore/transport</code> – inject network faults and observe transport metrics.</li>
 </ul>
@@ -394,7 +468,7 @@ iterator scan, distributed read/write via Raft apply), see
 <li><strong>Distributed</strong>: deploy <code>nokv serve</code> nodes, use <code>raftstore/client</code> (or any NoKV gRPC client) to perform reads, scans, and 2PC writes.</li>
 <li><strong>Observability-first</strong>: inspection via CLI or expvar is built-in; Region, WAL, Flush, and Raft metrics are accessible without extra instrumentation.</li>
 </ul>
-<p>See also <a href="raftstore.html"><code>docs/raftstore.md</code></a> for deeper internals, <a href="pd.html"><code>docs/pd.md</code></a> for control-plane details, and <a href="testing.html"><code>docs/testing.md</code></a> for coverage details.</p>
+<p>See also <a href="raftstore.html"><code>docs/raftstore.md</code></a> for deeper internals, <a href="coordinator.html"><code>docs/coordinator.md</code></a> for control-plane details, and <a href="testing.html"><code>docs/testing.md</code></a> for coverage details.</p>
 
                     </main>
 
@@ -447,6 +521,7 @@ iterator scan, distributed read/write via Raft apply), see
         <script src="book-a0b12cfe.js"></script>
 
         <!-- Custom JS scripts -->
+        <script src="docs/custom-732fa610.js"></script>
         <script src="docs/mermaid-init-8a66ee6c.js"></script>
 
 

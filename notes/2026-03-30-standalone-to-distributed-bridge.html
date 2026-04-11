@@ -3,43 +3,43 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>PD-lite - NoKV Docs</title>
+        <title>2026-03-30 从单机到分布式的桥接 - NoKV Docs</title>
 
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="">
+        <meta name="description" content="NoKV design, architecture, migration, and testing documentation.">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
-        <link rel="icon" href="favicon-de23e50b.svg">
-        <link rel="shortcut icon" href="favicon-8114d1fc.png">
-        <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-2459343d.css">
-        <link rel="stylesheet" href="css/chrome-ae938929.css">
-        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-ae938929.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
-        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
 
         <!-- Highlight.js Stylesheets -->
-        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
-        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
-        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="docs/custom-7218a61a.css">
+        <link rel="stylesheet" href="../docs/custom-a69f6233.css">
 
 
         <!-- Provide site root and default themes to javascript -->
         <script>
-            const path_to_root = "";
+            const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6fdcf697.js";
+            window.path_to_searchindex_js = "../searchindex-01a1bb3c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-5ff2b812.js"></script>
+        <script src="../toc-b8f8ac3b.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -106,7 +106,7 @@
             <!-- populated by js -->
             <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
             <noscript>
-                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
             </noscript>
             <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
                 <div class="sidebar-resize-indicator"></div>
@@ -141,7 +141,7 @@
                     <h1 class="menu-title">NoKV Docs</h1>
 
                     <div class="right-buttons">
-                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
                             <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
                         </a>
                         <a href="https://github.com/feichai0017/NoKV" title="Git repository" aria-label="Git repository">
@@ -178,141 +178,237 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="pd-lite"><a class="header" href="#pd-lite">PD-lite</a></h1>
-<p><code>PD-lite</code> is NoKV’s control-plane service for distributed mode.<br>It exposes a gRPC API (<code>pb.PD</code>) and is started by:</p>
-<pre><code class="language-bash">go run ./cmd/nokv pd --addr 127.0.0.1:2379
-</code></pre>
-<hr>
-<h2 id="1-responsibilities"><a class="header" href="#1-responsibilities">1. Responsibilities</a></h2>
-<p>PD-lite currently owns:</p>
+                        <h1 id="2026-03-30-从单机到分布式的桥接为什么是-nokv-的主线能力"><a class="header" href="#2026-03-30-从单机到分布式的桥接为什么是-nokv-的主线能力">2026-03-30 从单机到分布式的桥接为什么是 NoKV 的主线能力</a></h1>
+<blockquote>
+<p>状态：当前设计已经落地，相关实现分散在 <code>DB</code>、<code>raftstore</code>、<code>migrate</code>、<code>pd</code> 与 <code>meta/root</code> 中。本文重点不是复述命令，而是解释为什么 NoKV 没有把“单机版”和“分布式版”做成两套系统。</p>
+</blockquote>
+<h2 id="导读"><a class="header" href="#导读">导读</a></h2>
 <ul>
-<li><strong>Routing</strong>: <code>GetRegionByKey</code></li>
-<li><strong>Heartbeats</strong>: <code>StoreHeartbeat</code>, <code>RegionHeartbeat</code></li>
-<li><strong>Region removal</strong>: <code>RemoveRegion</code></li>
-<li><strong>ID service</strong>: <code>AllocID</code></li>
-<li><strong>TSO</strong>: <code>Tso</code></li>
+<li>🧭 主题：单机 workdir 如何通过协议提升成分布式 store，而不是走 dump/import 外挂工具路线。</li>
+<li>🧱 核心对象：<code>mode</code>、<code>snapshot</code>、<code>localmeta</code>、<code>seed region</code>。</li>
+<li>🔁 调用链：<code>standalone -&gt; preparing -&gt; seeded -&gt; cluster</code>。</li>
+<li>📚 参考对象：range/shard 系统的身份提升、Delos/FDB 一类的小控制面骨架。</li>
 </ul>
-<p>Runtime clients (for example <code>cmd/nokv-redis</code> raft backend) use PD as the
-routing source of truth.</p>
-<hr>
-<h2 id="2-runtime-architecture"><a class="header" href="#2-runtime-architecture">2. Runtime Architecture</a></h2>
-<pre class="mermaid">flowchart LR
-    Store["nokv serve"] --&gt;|"StoreHeartbeat / RegionHeartbeat"| PD["PD-lite (gRPC)"]
-    Gateway["nokv-redis (raft mode)"] --&gt;|"GetRegionByKey / Tso"| PD
-    PD --&gt; Cluster["pd/core.Cluster"]
-    Cluster --&gt; Scheduler["leader-transfer hint planner"]
+<h2 id="1-为什么这件事重要"><a class="header" href="#1-为什么这件事重要">1. 为什么这件事重要</a></h2>
+<p>很多 KV 项目在早期会先把单机版做出来，等到需要分布式能力时，再额外补一套新的元数据、恢复、运维和数据导入逻辑。这样做短期上手快，但长期会带来三个问题：</p>
+<ol>
+<li>单机数据和分布式数据不是同一个世界，后续只能 dump/import。</li>
+<li>运维和恢复心智要分两套，项目复杂度成倍增长。</li>
+<li>很多设计在单机阶段看起来成立，进入分布式后全部重做。</li>
+</ol>
+<p>NoKV 不希望走这条路。NoKV 的目标不是“先做一个单机 KV，再做一个分布式 KV”，而是：</p>
+<blockquote>
+<p>同一套数据面先以单机形态运行，再通过协议和恢复层逐步提升为分布式形态。</p>
+</blockquote>
+<h2 id="2-当前系统边界"><a class="header" href="#2-当前系统边界">2. 当前系统边界</a></h2>
+<p>当前相关实现主要分布在：</p>
+<ul>
+<li><code>db.go</code></li>
+<li><code>raftstore/localmeta</code></li>
+<li><code>raftstore/snapshot</code></li>
+<li><code>raftstore/mode</code></li>
+<li><code>raftstore/migrate</code></li>
+<li><code>pd</code></li>
+<li><code>meta/root</code></li>
+</ul>
+<p>分层如下：</p>
+<pre class="mermaid">flowchart TD
+    DB["DB / 单机数据面"] --&gt; LM["raftstore/localmeta\n本地恢复元数据"]
+    DB --&gt; SNAP["raftstore/snapshot\n逻辑 Region 快照"]
+    MODE["raftstore/mode\nworkdir 生命周期门"] --&gt; MIG["raftstore/migrate\n桥接协议"]
+    SNAP --&gt; MIG
+    LM --&gt; MIG
+    MIG --&gt; RS["raftstore\n分布式执行层"]
+    RS --&gt; PD["pd\nview + service"]
+    PD --&gt; MR["meta/root\n最小真相源"]
 </pre>
 
-<p>Core implementation units:</p>
-<ul>
-<li><code>pd/core</code>: in-memory cluster metadata model + allocators.</li>
-<li><code>pd/storage</code>: persistence abstraction (<code>Store</code>) with local manifest+state implementation.</li>
-<li><code>pd/server</code>: gRPC service + RPC validation/error mapping.</li>
-<li><code>pd/client</code>: client wrapper used by store/gateway.</li>
-<li><code>pd/adapter</code>: scheduler sink that forwards heartbeats into PD.</li>
-</ul>
-<hr>
-<h2 id="3-persistence---workdir"><a class="header" href="#3-persistence---workdir">3. Persistence (<code>--workdir</code>)</a></h2>
-<p>When <code>--workdir</code> is provided, PD-lite persists control-plane state:</p>
-<ul>
-<li><strong>Region catalog</strong> via manifest edits.</li>
-<li><strong>Allocator checkpoints</strong> via <code>PD_STATE.json</code>:
-<ul>
-<li><code>id_current</code></li>
-<li><code>ts_current</code></li>
-</ul>
-</li>
-</ul>
-<p>Startup flow:</p>
+<h3 id="关键判断"><a class="header" href="#关键判断">关键判断</a></h3>
 <ol>
-<li>Open <code>pd/storage</code> with <code>--workdir</code>.</li>
-<li>Load snapshot (<code>regions</code> + allocator counters).</li>
-<li>Compute starts as <code>max(cli_start, checkpoint+1)</code>.</li>
-<li>Replay region snapshot into <code>pd/core.Cluster</code>.</li>
+<li><code>DB</code> 仍然是底层共享数据面，不是导出后再导入另一种格式。</li>
+<li><code>raftstore/localmeta</code> 只负责 store-local 恢复，不是 cluster authority。</li>
+<li><code>raftstore/snapshot</code> 是逻辑 region 快照，不等于 raft durable snapshot metadata。</li>
+<li><code>migrate</code> 是协议，不是脚本集合。</li>
 </ol>
-<p>This avoids allocator rollback after restart and keeps route metadata stable.</p>
-<hr>
-<h2 id="4-config-integration"><a class="header" href="#4-config-integration">4. Config Integration</a></h2>
-<p><code>raft_config.json</code> supports PD endpoint + workdir defaults:</p>
-<pre><code class="language-json">"pd": {
-  "addr": "127.0.0.1:2379",
-  "docker_addr": "nokv-pd:2379",
-  "work_dir": "./artifacts/cluster/pd",
-  "docker_work_dir": "/var/lib/nokv-pd"
-}
-</code></pre>
-<p>Resolution rules:</p>
+<h2 id="3-如果不这样做会发生什么"><a class="header" href="#3-如果不这样做会发生什么">3. 如果不这样做，会发生什么</a></h2>
+<p>如果单机和分布式是两套系统，典型结果会是：</p>
 <ul>
-<li>CLI override wins.</li>
-<li>Otherwise read from config by scope (<code>host</code> / <code>docker</code>).</li>
+<li>单机目录直接被视为“旧格式”，只能整体导出。</li>
+<li>分布式 bootstrap 依赖外部工具，而不是系统自身的生命周期协议。</li>
+<li>恢复、校验、观测、测试路径出现双轨制。</li>
+<li>后面任何关于 snapshot、reshard、operator 的研究都要分别做两遍。</li>
 </ul>
-<p>Helpers:</p>
+<p>对于研究平台来说，这种分裂尤其糟糕。因为你无法回答一个最基本的问题：</p>
+<blockquote>
+<p>你研究的是同一个系统的扩展，还是两套系统之间的迁移工具？</p>
+</blockquote>
+<p>NoKV 现在的做法是明确回答前者。</p>
+<h2 id="4-当前设计怎么把桥接做成协议"><a class="header" href="#4-当前设计怎么把桥接做成协议">4. 当前设计怎么把桥接做成协议</a></h2>
+<p>核心不是 CLI 名字，而是状态边界。</p>
+<h3 id="41-workdir-mode-是正式协议"><a class="header" href="#41-workdir-mode-是正式协议">4.1 workdir mode 是正式协议</a></h3>
+<p>相关代码：</p>
 <ul>
-<li><code>config.ResolvePDAddr(scope)</code></li>
-<li><code>config.ResolvePDWorkDir(scope)</code></li>
-<li><code>nokv-config pd --field addr|workdir --scope host|docker</code></li>
+<li><code>raftstore/mode</code></li>
 </ul>
-<hr>
-<h2 id="5-routing-source-convergence"><a class="header" href="#5-routing-source-convergence">5. Routing Source Convergence</a></h2>
-<p>NoKV now uses <strong>PD-first routing</strong>:</p>
+<p>当前生命周期至少包括：</p>
 <ul>
-<li><code>raftstore/client</code> resolves regions with <code>GetRegionByKey</code>.</li>
-<li><code>raft_config</code> regions are bootstrap/deployment metadata.</li>
-<li>Runtime route truth comes from PD heartbeats + PD region catalog.</li>
+<li><code>standalone</code></li>
+<li><code>preparing</code></li>
+<li><code>seeded</code></li>
+<li><code>cluster</code></li>
 </ul>
-<p>This avoids dual sources drifting over time (config vs PD).</p>
-<hr>
-<h2 id="6-serve-mode-semantics"><a class="header" href="#6-serve-mode-semantics">6. Serve Mode Semantics</a></h2>
-<p><code>nokv serve</code> is now PD-only:</p>
+<p>这意味着：</p>
 <ul>
-<li><code>--pd-addr</code> is required.</li>
-<li>Runtime routing/scheduling control-plane state is sourced from PD.</li>
+<li>一个 workdir 不再永远被假设成普通本地 DB。</li>
+<li>一旦目录进入 <code>preparing/seeded/cluster</code>，普通单机打开路径就必须被 gate 住。</li>
+<li>生命周期不再靠“运维同学记住别手抖”，而是靠库级约束。</li>
 </ul>
-<p>Related CLI behavior:</p>
+<h3 id="42-snapshot-被分层而不是一个模糊大概念"><a class="header" href="#42-snapshot-被分层而不是一个模糊大概念">4.2 snapshot 被分层，而不是一个模糊大概念</a></h3>
+<p>相关代码：</p>
 <ul>
-<li>Inspect control-plane state through PD APIs/metrics.</li>
-<li><code>nokv pd --metrics-addr &lt;host:port&gt;</code> exposes native expvar on <code>/debug/vars</code>.</li>
-<li><code>nokv serve --metrics-addr &lt;host:port&gt;</code> exposes store/runtime expvar on <code>/debug/vars</code>.</li>
+<li><code>raftstore/engine/snapshot.go</code></li>
+<li><code>raftstore/snapshot</code></li>
 </ul>
-<hr>
-<h2 id="7-comparison-tinykv--tikv"><a class="header" href="#7-comparison-tinykv--tikv">7. Comparison: TinyKV / TiKV</a></h2>
-<h3 id="tinykv-teaching-stack"><a class="header" href="#tinykv-teaching-stack">TinyKV (teaching stack)</a></h3>
+<p>当前有两层 snapshot：</p>
+<ol>
+<li>raft durable metadata snapshot</li>
+<li>region logical state snapshot</li>
+</ol>
+<p>这条分层很重要，因为单机提升到分布式，真正需要提升的是：</p>
 <ul>
-<li>Uses a scheduler server (<code>tinyscheduler</code>) as separate process.</li>
-<li>Control plane integrates embedded etcd for metadata persistence.</li>
-<li>Educational architecture, minimal production hardening.</li>
+<li>key range 对应的数据状态</li>
+<li>region identity</li>
+<li>peer identity</li>
+<li>local recovery metadata</li>
 </ul>
-<h3 id="tikv-production-stack"><a class="header" href="#tikv-production-stack">TiKV (production stack)</a></h3>
+<p>而不是只搬一份 term/index/confstate。</p>
+<h3 id="43-migrate-是状态提升协议不是命令拼接"><a class="header" href="#43-migrate-是状态提升协议不是命令拼接">4.3 migrate 是状态提升协议，不是命令拼接</a></h3>
+<p>相关代码：</p>
 <ul>
-<li>PD is an independent, highly available cluster.</li>
-<li>PD internally uses etcd Raft for durable metadata + leader election.</li>
-<li>Rich scheduling and balancing policies, rolling updates, robust ops tooling.</li>
+<li><code>raftstore/migrate/init.go</code></li>
+<li><code>raftstore/migrate/expand.go</code></li>
 </ul>
-<h3 id="nokv-pd-lite-current"><a class="header" href="#nokv-pd-lite-current">NoKV PD-lite (current)</a></h3>
+<p>当前主线可以概括成：</p>
+<pre class="mermaid">sequenceDiagram
+    participant DB as 单机 workdir
+    participant MODE as mode gate
+    participant MIG as migrate
+    participant RS as raftstore
+    participant PD as pd/meta
+
+    DB-&gt;&gt;MODE: standalone -&gt; preparing
+    MODE-&gt;&gt;MIG: 允许写入 seed 语义
+    MIG-&gt;&gt;RS: init 一个 full-range seed region
+    RS-&gt;&gt;MODE: preparing -&gt; seeded
+    MIG-&gt;&gt;RS: serve / expand
+    RS-&gt;&gt;PD: 加入 cluster control-plane
+    RS-&gt;&gt;MODE: seeded -&gt; cluster
+</pre>
+
+<p>这里真正值钱的是：</p>
 <ul>
-<li>Single PD-lite process with optional local persistence (<code>--workdir</code>).</li>
-<li>Sufficient for local clusters, testing, and architecture iteration.</li>
-<li>API shape intentionally aligned with a PD-style control plane so migration to
-stronger HA semantics is incremental.</li>
+<li>state promotion 有明确边界</li>
+<li>snapshot 有明确边界</li>
+<li>恢复和正常执行走同一套语义</li>
 </ul>
-<hr>
-<h2 id="8-current-limitations--next-steps"><a class="header" href="#8-current-limitations--next-steps">8. Current Limitations / Next Steps</a></h2>
+<h2 id="5-调用逻辑"><a class="header" href="#5-调用逻辑">5. 调用逻辑</a></h2>
+<h3 id="migrate-init"><a class="header" href="#migrate-init"><code>migrate init</code></a></h3>
+<p>目标：</p>
 <ul>
-<li>No multi-PD quorum and no automatic PD failover.</li>
-<li>Scheduler policy is intentionally small (leader transfer focused).</li>
-<li>No advanced placement constraints yet.</li>
+<li>给原 standalone workdir 写入 seed region 语义</li>
+<li>让它不再只是“一个 DB 目录”</li>
 </ul>
-<p>These are deliberate scope limits for a fast-moving experimental platform.</p>
+<p>做的事情大致是：</p>
+<ol>
+<li>检查当前 mode 是否允许提升。</li>
+<li>为 workdir 生成初始 region / peer / localmeta。</li>
+<li>导出逻辑 region snapshot 或建立 seed state。</li>
+<li>把目录推进到 <code>seeded</code>。</li>
+</ol>
+<h3 id="serve"><a class="header" href="#serve"><code>serve</code></a></h3>
+<p>目标：</p>
+<ul>
+<li>让 seeded workdir 进入真正的 cluster 语义</li>
+</ul>
+<p>做的事情大致是：</p>
+<ol>
+<li>启动 <code>raftstore</code>。</li>
+<li>恢复本地 <code>replicas.binpb</code> 和 <code>raft-progress.binpb</code>。</li>
+<li>向 <code>pd</code> / <code>meta/root</code> 注册 rooted truth。</li>
+<li>开始按 region/peer 身份参与执行面。</li>
+</ol>
+<h3 id="expand"><a class="header" href="#expand"><code>expand</code></a></h3>
+<p>目标：</p>
+<ul>
+<li>把 seed region 扩成 replicated region</li>
+</ul>
+<p>做的事情大致是：</p>
+<ol>
+<li>生成新的 peer change / split / merge 目标。</li>
+<li>通过 <code>pd</code> proposal gate 进入 <code>meta/root</code>。</li>
+<li>由 <code>raftstore</code> 执行真正的 conf change / snapshot install。</li>
+<li>terminal truth 回写 <code>meta/root</code>。</li>
+</ol>
+<h2 id="6-设计理念"><a class="header" href="#6-设计理念">6. 设计理念</a></h2>
+<p>这条桥接路线背后的理念有三条：</p>
+<h3 id="61-不重复造两套数据面"><a class="header" href="#61-不重复造两套数据面">6.1 不重复造两套数据面</a></h3>
+<p>单机和分布式共享底层 DB / LSM / WAL / VLog。</p>
+<h3 id="62-身份提升比数据搬运更重要"><a class="header" href="#62-身份提升比数据搬运更重要">6.2 身份提升比数据搬运更重要</a></h3>
+<p>困难不在于“把字节拷过去”，而在于：</p>
+<ul>
+<li>让原本匿名的本地状态变成带 region/peer 身份的状态</li>
+<li>让它进入可恢复、可验证、可编排的 cluster 生命周期</li>
+</ul>
+<h3 id="63-迁移必须走协议"><a class="header" href="#63-迁移必须走协议">6.3 迁移必须走协议</a></h3>
+<p>如果桥接只是一个脚本，后面所有关于：</p>
+<ul>
+<li>restore</li>
+<li>reshard</li>
+<li>operator runtime</li>
+<li>snapshot install</li>
+<li>failover</li>
+</ul>
+<p>的研究都会变得含糊不清。</p>
+<h2 id="7-参考对象"><a class="header" href="#7-参考对象">7. 参考对象</a></h2>
+<p>这一块没有直接照搬某一个系统，但思路上接近几类工业实践：</p>
+<ul>
+<li>TiKV / Cockroach 里关于 range/shard 身份与复制元数据分层的经验</li>
+<li>FoundationDB / Delos 一类系统里“让小而稳定的控制面成为系统骨架”的思路</li>
+<li>数据库内核里“把生命周期写进协议而不是运维手册”的做法</li>
+</ul>
+<h2 id="8-当前实现已经做到的"><a class="header" href="#8-当前实现已经做到的">8. 当前实现已经做到的</a></h2>
+<ul>
+<li>workdir mode 已经进入正式实现</li>
+<li>localmeta 与 engine metadata 已明确分开</li>
+<li>region snapshot 已是单独层</li>
+<li>migration 主线已形成 protocol 化入口</li>
+<li>后续 <code>pd</code> / <code>meta/root</code> 主线能直接承接这条桥</li>
+</ul>
+<h2 id="9-还没做完的"><a class="header" href="#9-还没做完的">9. 还没做完的</a></h2>
+<ul>
+<li>更成熟的 migration observability</li>
+<li>更系统的 operator runtime 编排</li>
+<li>更完整的 snapshot install 与 reshard 联动</li>
+<li>对超大数据量场景的性能与恢复策略</li>
+</ul>
+<h2 id="10-总结"><a class="header" href="#10-总结">10. 总结</a></h2>
+<p>NoKV 这条“从单机到分布式”的桥接路线，真正值钱的不是多了几条 CLI，而是：</p>
+<ul>
+<li>它没有把单机和分布式做成两套系统</li>
+<li>它把 state promotion 写成了协议</li>
+<li>它让后续关于 control-plane、operator、snapshot、调度的研究，都能建立在同一套系统之上</li>
+</ul>
+<p>这比“再做一个分布式 KV 外壳”更重要，因为它决定了 NoKV 后面能不能持续演进，而不是每往前走一步都重造一层。</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="raftstore.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../notes/2026-02-15-vfs-abstraction-and-deterministic-reliability.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="recovery.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../notes/2026-03-30-pd-and-raftadmin-layering.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -322,11 +418,11 @@ stronger HA semantics is incremental.</li>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="raftstore.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../notes/2026-02-15-vfs-abstraction-and-deterministic-reliability.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="recovery.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../notes/2026-03-30-pd-and-raftadmin-layering.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>
@@ -346,16 +442,17 @@ stronger HA semantics is incremental.</li>
         </script>
 
 
-        <script src="elasticlunr-ef4e11c1.min.js"></script>
-        <script src="mark-09e88c2c.min.js"></script>
-        <script src="searcher-c2a407aa.js"></script>
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
 
-        <script src="clipboard-1626706a.min.js"></script>
-        <script src="highlight-abc7f01d.js"></script>
-        <script src="book-a0b12cfe.js"></script>
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
 
         <!-- Custom JS scripts -->
-        <script src="docs/mermaid-init-8a66ee6c.js"></script>
+        <script src="../docs/custom-732fa610.js"></script>
+        <script src="../docs/mermaid-init-8a66ee6c.js"></script>
 
 
 

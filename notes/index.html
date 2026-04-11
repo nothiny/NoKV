@@ -3,12 +3,12 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Notes - NoKV Docs</title>
+        <title>设计笔记与实现记录 - NoKV Docs</title>
 
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="">
+        <meta name="description" content="NoKV design, architecture, migration, and testing documentation.">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="../docs/custom-7218a61a.css">
+        <link rel="stylesheet" href="../docs/custom-a69f6233.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-6fdcf697.js";
+            window.path_to_searchindex_js = "../searchindex-01a1bb3c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-5ff2b812.js"></script>
+        <script src="../toc-b8f8ac3b.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -178,22 +178,187 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="notes"><a class="header" href="#notes">Notes</a></h1>
-<p>Use this folder to capture per-debug or per-investigation notes. Keep entries short, factual, and easy to skim.</p>
-<h2 id="add-a-new-note"><a class="header" href="#add-a-new-note">Add a new note</a></h2>
+                        <h1 id="设计笔记与实现记录"><a class="header" href="#设计笔记与实现记录">设计笔记与实现记录</a></h1>
+<p>这一节是 NoKV 的长文档区域。</p>
+<p>主文档更偏参考手册，<code>notes</code> 更像工程记录与技术随笔，主要用来解释：</p>
+<ul>
+<li>某个边界为什么存在</li>
+<li>某次实现为什么要推翻重做</li>
+<li>哪些“看起来简单”的方案最后证明是错的</li>
+<li>代码库在演进过程中学到了什么</li>
+</ul>
+<div class="blog-hero">
+  
+<div class="blog-hero-copy">
+    <span class="masthead-kicker">工程日志</span>
+    
+<h2>NoKV 是怎么被做出来的</h2>
+
+    
+<p>这些文章记录设计取舍、实现教训、调试过程，以及代码中那些边界背后的原因。</p>
+
+  </div>
+
+  
+<div class="blog-hero-meta">
+    
+<div class="tag-pill">设计</div>
+
+    
+<div class="tag-pill">实现</div>
+
+    
+<div class="tag-pill">分布式系统</div>
+
+    
+<div class="tag-pill">存储内核</div>
+
+  </div>
+
+</div>
+
+<h2 id="推荐阅读"><a class="header" href="#推荐阅读">推荐阅读</a></h2>
+<div class="blog-grid">
+  
+<div class="blog-card">
+    <span class="blog-date">2026-03-30</span>
+    
+<h3><a href="2026-03-30-standalone-to-distributed-bridge.html">从单机到分布式的桥接</a></h3>
+
+    
+<p>解释为什么 NoKV 把单机和分布式视为同一套系统，以及为什么迁移必须做成协议而不是 dump/import 工具。</p>
+
+  </div>
+
+  
+<div class="blog-card">
+    <span class="blog-date">2026-03-30</span>
+    
+<h3><a href="2026-03-30-pd-and-raftadmin-layering.html">PD 与执行面分层</a></h3>
+
+    
+<p>解释为什么 control plane、truth kernel 和 data-plane executor 必须分开，以及为什么 PD 不能直接写本地 truth。</p>
+
+  </div>
+
+  
+<div class="blog-card">
+    <span class="blog-date">2026-03-30</span>
+    
+<h3><a href="2026-03-30-migration-mode-and-snapshot.html">迁移里的 mode 与 snapshot 语义</a></h3>
+
+    
+<p>说明 migration 的本体其实是目录生命周期协议和 snapshot 分层，而不是补几条 CLI 命令。</p>
+
+  </div>
+
+  
+<div class="blog-card">
+    <span class="blog-date">2026-03-30</span>
+    
+<h3><a href="2026-03-30-distributed-testing-and-failpoints.html">分布式测试与 failpoint</a></h3>
+
+    
+<p>解释为什么 NoKV 同时使用 live integration、testcluster 和窄边界 failpoint，以及 failpoint 应该如何克制。</p>
+
+  </div>
+
+  
+<div class="blog-card">
+    <span class="blog-date">2026-03-31</span>
+    
+<h3><a href="2026-03-31-sst-snapshot-install.html">基于 SST 的 Snapshot Install</a></h3>
+
+    
+<p>说明 NoKV 为什么选择 region-scoped、self-contained、与源端 vlog 独立的 SST snapshot install 方案。</p>
+
+  </div>
+
+  
+<div class="blog-card">
+    <span class="blog-date">2026-04-03</span>
+    
+<h3><a href="2026-04-03-delos-lite-metadata-root-roadmap.html">Rooted Metadata、Delos-lite 与 Virtual Log</a></h3>
+
+    
+<p>完整说明 NoKV 当前的 metadata truth、PD 隔离、Virtual Log substrate、local/replicated backend，以及为什么这条主线适合作为后续研究平台。</p>
+
+  </div>
+
+  
+<div class="blog-card">
+    <span class="blog-date">2026-04-05</span>
+    
+<h3><a href="2026-04-05-range-filter-from-grf.html">Range Filter：从 GRF 得到启发，但不照搬 GRF</a></h3>
+
+    
+<p>解释 NoKV 为什么需要 read-path pruning、GRF 到底提供了什么启发、为什么当前实现选择更保守的 in-memory advisory 方案，以及它与 LSM 读路径的关系。</p>
+
+  </div>
+
+</div>
+
+<h2 id="这里应该写什么"><a class="header" href="#这里应该写什么">这里应该写什么</a></h2>
+<ul>
+<li>参考文档放不下的设计取舍</li>
+<li>有明确症状、错误假设和最终修复的调试记录</li>
+<li>带 benchmark 背景和设计解释的性能调查</li>
+<li>解释包边界为何变化的重构说明</li>
+</ul>
+<h2 id="写作风格"><a class="header" href="#写作风格">写作风格</a></h2>
+<p>每篇 note 都应该像一篇小型技术博客，但保持工程视角：</p>
 <ol>
-<li>Create a new file in <code>docs/notes/</code> named <code>YYYY-MM-DD-short-title.md</code>.</li>
-<li>Add it to <code>docs/SUMMARY.md</code> under Notes.</li>
-<li>Use the template below to keep entries consistent.</li>
+<li>从具体问题或设计问题开始</li>
+<li>先把系统边界讲清楚</li>
+<li>讲清 tradeoff 和被否决的方案</li>
+<li>需要时放图、调用链、对象关系和命令</li>
+<li>最后说明代码里已经改了什么、还有什么没解决</li>
 </ol>
-<h2 id="template"><a class="header" href="#template">Template</a></h2>
-<h3 id="context"><a class="header" href="#context">Context</a></h3>
-<h3 id="symptom"><a class="header" href="#symptom">Symptom</a></h3>
-<h3 id="repro"><a class="header" href="#repro">Repro</a></h3>
-<h3 id="investigation"><a class="header" href="#investigation">Investigation</a></h3>
-<h3 id="root-cause"><a class="header" href="#root-cause">Root cause</a></h3>
-<h3 id="fix"><a class="header" href="#fix">Fix</a></h3>
-<h3 id="follow-ups"><a class="header" href="#follow-ups">Follow-ups</a></h3>
+<p><code>notes</code> 的重点是解释设计和演进，而不是把正文写成文件导航。除非某个模块名或文件名对理解确实必要，否则不需要强制罗列具体代码路径；相比“这个函数在哪”，更重要的是“为什么这样分层、为什么不选别的路、边界到底是什么”。</p>
+<p>建议在最近的设计类 note 顶部增加一个简短导读块，至少包含：</p>
+<ul>
+<li>🧭 主题</li>
+<li>🧱 核心对象</li>
+<li>🔁 调用链</li>
+<li>📚 参考对象</li>
+</ul>
+<h2 id="建议模板"><a class="header" href="#建议模板">建议模板</a></h2>
+<pre><code class="language-md"># 标题
+
+## 导读
+
+- 🧭 主题：
+- 🧱 核心对象：
+- 🔁 调用链：
+- 📚 参考对象：
+
+## 为什么这件事重要
+
+## 当前系统边界
+
+## 看起来简单但其实错的路
+
+## 我们最终采用的设计
+
+## 关键对象与边界
+
+## 图示与调用逻辑
+
+## 设计理念
+
+## 参考对象
+
+## 这次改变了什么
+
+## 还没解决什么
+</code></pre>
+<h2 id="新增一篇-note"><a class="header" href="#新增一篇-note">新增一篇 note</a></h2>
+<ol>
+<li>创建 <code>docs/notes/YYYY-MM-DD-short-title.md</code></li>
+<li>把它加到 <code>docs/SUMMARY.md</code></li>
+<li>优先写清楚图、对象关系、调用链和设计理念，少写空泛描述</li>
+<li><code>notes</code> 统一使用中文撰写；必要时保留英文术语，但不要把正文写成中英混杂的半成品</li>
+</ol>
 
                     </main>
 
@@ -246,6 +411,7 @@
         <script src="../book-a0b12cfe.js"></script>
 
         <!-- Custom JS scripts -->
+        <script src="../docs/custom-732fa610.js"></script>
         <script src="../docs/mermaid-init-8a66ee6c.js"></script>
 
 

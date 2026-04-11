@@ -3,12 +3,12 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>2026-02-09 Write Pipeline: MPSC &amp; Adaptive Batching - NoKV Docs</title>
+        <title>2026-02-09 Write Pipeline：MPSC 与 Adaptive Batching - NoKV Docs</title>
 
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="">
+        <meta name="description" content="NoKV design, architecture, migration, and testing documentation.">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="../docs/custom-7218a61a.css">
+        <link rel="stylesheet" href="../docs/custom-a69f6233.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-6fdcf697.js";
+            window.path_to_searchindex_js = "../searchindex-01a1bb3c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-5ff2b812.js"></script>
+        <script src="../toc-b8f8ac3b.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -187,32 +187,38 @@
 <p>在 LSM 引擎中，WAL (预写日志) 的写入必须是严格顺序的。如果让 1000 个用户协程并发地调用 <code>write()</code> 系统调用，内核态的上下文切换和文件锁竞争会瞬间压垮系统。
 NoKV 通过 MPSC 模型，将数千个前台并发压力汇聚到一个后台 <code>commitWorker</code> 中，将随机小写入转化为大块的顺序磁盘 IO。</p>
 <h3 id="12-核心组件commitqueue"><a class="header" href="#12-核心组件commitqueue">1.2 核心组件：commitQueue</a></h3>
-<p><code>commitQueue</code>（位于 <code>db_write.go</code>）并不是一个简单的 Channel，它是由三部分构成的协同系统：</p>
+<p><code>commitQueue</code>（位于 <code>db_write.go</code>）现在是一个围绕
+<code>utils.MPSCQueue[*commitRequest]</code> 封装的专用写入队列，而不是旧的
+RingBuffer + 双 channel 协议。当前实现由三部分组成：</p>
 <ul>
-<li><strong>RingBuffer</strong>：基于原子序列号的无锁循环队列，负责极速的数据传递。</li>
-<li><strong>Spaces Channel</strong>：作为“票据”系统，控制队列的硬上限，形成天然的 <strong>Backpressure (背压)</strong>。</li>
-<li><strong>Items Channel</strong>：作为“唤醒”信号，通知后台 Worker 有新数据到达，避免 Worker 空转浪费 CPU。</li>
+<li><strong>Bounded MPSC queue</strong>：基于每槽位 sequence 的 bounded
+multi-producer/single-consumer 队列，提供严格单 consumer 语义和显式
+shutdown。</li>
+<li><strong>Long-lived consumer session</strong>：<code>commitWorker</code> 启动后只获取一次
+<code>MPSCConsumer</code>，通过 <code>Pop</code>/<code>DrainReady</code> 批量取请求，减少热路径上的重复
+acquire/release 开销。</li>
+<li><strong>队列外统计与背压</strong>：<code>pendingEntries</code>、<code>pendingBytes</code> 和
+<code>ReservedLen()</code> 共同决定积压观测与批次放大；队列满时由 <code>MPSCQueue</code>
+自身阻塞 producer，而不是依赖额外 “spaces/items” channel。</li>
 </ul>
 <hr>
 <h2 id="2-自适应批处理算法-adaptive-coalescing"><a class="header" href="#2-自适应批处理算法-adaptive-coalescing">2. 自适应批处理算法 (Adaptive Coalescing)</a></h2>
 <p><code>nextCommitBatch</code> 是整个流水线的灵魂。它不是死板地按照固定大小打包，而是能够根据系统负载动态调整其“吞吐模式”。</p>
 <h3 id="21-积压驱动的动态上限"><a class="header" href="#21-积压驱动的动态上限">2.1 积压驱动的动态上限</a></h3>
-<p>系统实时监控队列积压程度 (<code>queueLen</code>)。当积压严重时，Worker 会自动“变强”：</p>
+<p>系统实时监控队列积压程度（<code>commitQueue.len()</code>，底层是
+<code>MPSCQueue.ReservedLen()</code>）。当积压严重时，Worker 会自动“变强”：</p>
 <pre><code class="language-go">// 动态调整 Batch 限制
-backlog := int(cq.queueLen.Load())
+backlog := cq.len()
 if backlog &gt; limitCount {
     // 如果队列积压，按比例放大 Batch 大小，最高 4 倍
     factor := min(max(backlog/limitCount, 1), 4)
-    limitCount = min(limitCount * factor, hardLimit)
+    limitCount = min(limitCount*factor, backlog)
     limitSize *= int64(factor)
 }
 </code></pre>
 <p><strong>设计价值</strong>：这利用了批处理的规模效应。压力越大，聚合度越高，单次磁盘 I/O 摊薄的成本就越低，从而在高压下实现吞吐量的“逆增长”。</p>
-<h3 id="22-热点感知倍率-hot-aware"><a class="header" href="#22-热点感知倍率-hot-aware">2.2 热点感知倍率 (Hot-Aware)</a></h3>
-<p>如果 Batch 中包含由 <code>hotTracker</code> 识别出的热点写 Key，系统会应用 <code>HotWriteBatchMultiplier</code>。</p>
-<ul>
-<li><strong>原理</strong>：对于热点 Key，多次写入往往可以合并。通过扩大 Batch，我们让热点请求在进入 WAL 之前有更多机会在内存中被“折叠”，极大减轻了物理磁盘的带宽压力。</li>
-</ul>
+<h3 id="22-现状"><a class="header" href="#22-现状">2.2 现状</a></h3>
+<p>当前实现不再基于 HotRing 放大写批次。批处理大小只由队列压力和显式批次限制决定。</p>
 <h3 id="23-coalesce-等待机制"><a class="header" href="#23-coalesce-等待机制">2.3 Coalesce 等待机制</a></h3>
 <p>在队列瞬时为空时，Worker 不会立即触发提交，而是会短暂等待一个 <code>WriteBatchWait</code>（默认 200us）。这个微小的停顿是低延迟与高吞吐之间的微妙平衡点，它能让微量的突发流量共享一次 <code>fsync</code> 成本。</p>
 <hr>
@@ -221,11 +227,11 @@ if backlog &gt; limitCount {
     A[User db.Set/Apply] --&gt; B{L0 Throttle Check?}
     B -- Blocked --&gt; A
     B -- Pass --&gt; C[Encode Internal Key]
-    C --&gt; D[Push to RingBuffer]
+    C --&gt; D["Push to MPSC commit queue"]
     D --&gt; E[Wait for Request.WaitGroup]
     
     subgraph "commitWorker (Background)"
-        F[nextCommitBatch: Collect Requests] --&gt; G[vlog.write: Value Separation]
+        F["nextCommitBatch: Pop + DrainReady"] --&gt; G[vlog.write: Value Separation]
         G --&gt; H[wal.Append: Durability]
         H --&gt; I[lsm.SetBatch: Index Apply]
         I --&gt; J{SyncWrites Enabled?}
@@ -269,11 +275,12 @@ for i, cr := range batch.reqs {
 <tr><td style="text-align: left"><code>WriteBatchMaxCount</code></td><td style="text-align: left">64</td><td style="text-align: left">聚合深度。提高可增加吞吐，但会拉长 P99 延迟。</td></tr>
 <tr><td style="text-align: left"><code>WriteBatchWait</code></td><td style="text-align: left">200us</td><td style="text-align: left">聚合等待时间。Sync 写场景下建议保留，非 Sync 场景可设为 0。</td></tr>
 <tr><td style="text-align: left"><code>SyncWrites</code></td><td style="text-align: left">false</td><td style="text-align: left">是否每次 Batch 都调用 <code>fsync</code>。设为 true 会让吞吐下降一个数量级，但保证强持久性。</td></tr>
-<tr><td style="text-align: left"><code>HotWriteMultiplier</code></td><td style="text-align: left">2</td><td style="text-align: left">热点聚合倍率。对于倾斜严重的负载，可设为 4。</td></tr>
 </tbody>
 </table>
 </div>
-<p><strong>总结</strong>：NoKV 的写路径通过“牺牲”极微小的入队延迟，换取了极其稳健的磁盘顺序写入带宽。这种 <strong>“漏斗式”</strong> 的设计配合 <strong>自适应调节算法</strong>，是 NoKV 能够从容应对分布式环境下突发写潮汐的关键所在。</p>
+<p><strong>总结</strong>：NoKV 的写路径通过 bounded MPSC 聚合、批量 <code>DrainReady</code> 和
+显式的 value-log / LSM / sync 分段，避免前台协程直接竞争底层持久化路径。
+这种“漏斗式”设计配合自适应批处理，是当前写入吞吐和尾延迟控制的关键。</p>
 
                     </main>
 
@@ -326,6 +333,7 @@ for i, cr := range batch.reqs {
         <script src="../book-a0b12cfe.js"></script>
 
         <!-- Custom JS scripts -->
+        <script src="../docs/custom-732fa610.js"></script>
         <script src="../docs/mermaid-init-8a66ee6c.js"></script>
 
 

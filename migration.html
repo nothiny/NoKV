@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Cache - NoKV Docs</title>
+        <title>Migration - NoKV Docs</title>
 
 
         <!-- Custom HTML head -->
@@ -178,113 +178,431 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="cache--bloom-filters"><a class="header" href="#cache--bloom-filters">Cache &amp; Bloom Filters</a></h1>
-<p>NoKV’s LSM tier layers a multi-level block cache with decoded index caching to accelerate lookups. Bloom filters remain embedded in SST indexes and are probed directly from <code>pb.TableIndex</code>. The implementation is in <a href="../lsm/cache.go"><code>lsm/cache.go</code></a>.</p>
-<hr>
-<h2 id="1-components"><a class="header" href="#1-components">1. Components</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Component</th><th>Purpose</th><th>Source</th></tr>
-</thead>
-<tbody>
-<tr><td><code>cache.indexes</code></td><td>Byte-budgeted W-TinyLFU cache for decoded table indexes (<code>fid</code> → <code>*pb.TableIndex</code>).</td><td><a href="../utils/cache"><code>utils/cache</code></a></td></tr>
-<tr><td><code>blockCache</code></td><td>Ristretto-based block cache (L0/L1 only) with per-table direct slots.</td><td><a href="../lsm/cache.go"><code>lsm/cache.go</code></a></td></tr>
-<tr><td><code>cacheMetrics</code></td><td>Atomic hit/miss counters for L0/L1 blocks and indexes.</td><td><a href="../lsm/cache.go#L30-L110"><code>lsm/cache.go#L30-L110</code></a></td></tr>
-</tbody>
-</table>
+                        <h1 id="from-standalone-to-cluster"><a class="header" href="#from-standalone-to-cluster">From Standalone to Cluster</a></h1>
+<p class="chapter-lead">
+NoKV does not treat standalone and distributed mode as two separate products glued together later. The migration path promotes an existing standalone workdir into a distributed seed, then expands that seed into a replicated multi-Raft region without swapping out the storage core.
+</p>
+
+<div class="mini-toc">
+  
+<p class="mini-toc-title">On This Page</p>
+
+  
+<ul class="mini-toc-list">
+    
+<li><a href="#why-this-feature-matters">Why This Feature Matters</a></li>
+
+    
+<li><a href="#the-minimal-operator-flow">The Minimal Operator Flow</a></li>
+
+    
+<li><a href="#what-actually-happens">What Actually Happens</a></li>
+
+    
+<li><a href="#failure-semantics">Failure Semantics</a></li>
+
+    
+<li><a href="#what-comes-next">What Comes Next</a></li>
+
+  </ul>
+
 </div>
-<p>Badger exposes separate block/index cache budgets while Pebble uses a unified cache budget. NoKV keeps block and index caches explicit; bloom filters piggyback on the decoded table index already held by each live SST.</p>
-<hr>
-<h3 id="11-index-cache--handles"><a class="header" href="#11-index-cache--handles">1.1 Index Cache &amp; Handles</a></h3>
+
+<blockquote>
+<p>Read this page if the most interesting question in NoKV is not “how fast is it” but “how an existing standalone engine becomes a distributed system without switching data planes”.</p>
+</blockquote>
+<h2 id="why-this-feature-matters"><a class="header" href="#why-this-feature-matters">Why This Feature Matters</a></h2>
+<p>Most systems make you choose early:</p>
 <ul>
-<li>SSTable metadata stays with the <code>table</code> struct, while decoded protobuf indexes are stored in <code>cache.indexes</code>. Lookups first hit the cache before falling back to disk.</li>
-<li>SST handles are reopened on demand for lower levels. L0/L1 tables keep their file descriptors pinned, while deeper levels close them once no iterator is using the table.</li>
+<li>start with an embedded engine, then migrate to a different distributed database later</li>
+<li>start distributed from day one, even when the workload is still small</li>
+<li>accept dump/import-style migration as an operational tax</li>
 </ul>
-<hr>
-<h2 id="2-block-cache-strategy"><a class="header" href="#2-block-cache-strategy">2. Block Cache Strategy</a></h2>
-<pre><code class="language-text">User-space block cache (L0/L1, parsed blocks, Ristretto LFU-ish)
-Deeper levels rely on OS page cache + mmap readahead
-</code></pre>
+<p>NoKV is aiming at a different story:</p>
+<ol>
+<li>Start with a serious standalone engine.</li>
+<li>Keep the same workdir and the same storage substrate as data grows.</li>
+<li>Promote that workdir into a distributed seed explicitly.</li>
+<li>Expand the seed into a replicated cluster through normal raftstore mechanisms.</li>
+</ol>
+<p>That is the core value of this feature. The goal is not “add one more migration command”. The goal is to make standalone and distributed shapes feel like one system with one data plane.</p>
+<h2 id="what-is-shipping-now"><a class="header" href="#what-is-shipping-now">What Is Shipping Now</a></h2>
+<p>The current migration design is intentionally conservative:</p>
 <ul>
-<li><code>Options.BlockCacheBytes</code> sets the block-cache budget in bytes. Entries are admitted with an estimated block footprint, so larger blocks naturally consume more of the budget.</li>
-<li>Per-table direct slots (<code>table.cacheSlots[idx]</code>) give a lock-free fast path. Misses fall back to the shared Ristretto cache (approx LFU with admission).</li>
-<li>Evictions clear the table slot via <code>OnEvict</code>; user-space cache only tracks L0/L1 blocks. Deeper levels depend on the OS page cache.</li>
-<li>Access patterns: <code>getBlock</code> also updates hit/miss metrics for L0/L1; deeper levels bypass the cache and do not affect metrics.</li>
+<li>offline only</li>
+<li>one-shot bootstrap</li>
+<li>no dual-write cutover</li>
+<li>no background auto-repair</li>
+<li>no automatic split or rebalance during promotion</li>
+<li>one full-range seed region for the initial upgrade</li>
 </ul>
+<p>That scope is deliberate. The first version is trying to make the protocol explicit, recoverable, and testable before chasing more automation.</p>
+<h2 id="the-core-contract"><a class="header" href="#the-core-contract">The Core Contract</a></h2>
+<p>The migration path must preserve these invariants:</p>
+<ol>
+<li>Standalone writes stop before migration starts.</li>
+<li>The migrated workdir must not silently reopen as a normal standalone directory.</li>
+<li>Bootstrap is the only allowed non-apply path that creates the initial region truth for the promoted directory.</li>
+<li>Engine manifest stays storage-engine metadata only.</li>
+<li>Store-local region truth stays in <code>raftstore/localmeta</code>.</li>
+<li>Coordinator does not create local truth during bootstrap.</li>
+</ol>
+<p>Those invariants are what make the feature defensible. Without them, “standalone to cluster” collapses into ad hoc tooling.</p>
+<h2 id="the-minimal-operator-flow"><a class="header" href="#the-minimal-operator-flow">The Minimal Operator Flow</a></h2>
 <pre class="mermaid">flowchart LR
-  Read --&gt; CheckCache
-  CheckCache --&gt;|hit| Return
-  CheckCache --&gt;|miss| LoadFromTable["LoadFromTable (mmap + OS page cache)"]
-  LoadFromTable --&gt; InsertCache
-  InsertCache --&gt; Return
+    A["Standalone workdir"] --&gt; B["nokv migrate plan"]
+    B --&gt; C["nokv migrate init"]
+    C --&gt; D["Seeded workdir"]
+    D --&gt; E["nokv serve --coordinator-addr ..."]
+    E --&gt; F["Single-store cluster seed"]
+    F --&gt; G["nokv migrate expand"]
+    G --&gt; H["Replicated cluster"]
 </pre>
 
-<p>By default only L0 and L1 blocks are cached (<code>level &gt; 1</code> short-circuits), reflecting the higher re-use for top levels.</p>
-<hr>
-<h2 id="3-bloom-filters"><a class="header" href="#3-bloom-filters">3. Bloom Filters</a></h2>
+<h3 id="happy-path-cli"><a class="header" href="#happy-path-cli">Happy-path CLI</a></h3>
+<pre><code class="language-bash"># 1. Inspect a standalone workdir
+go run ./cmd/nokv migrate plan --workdir ./data/store-1
+
+# 2. Promote it into a single-store seed
+go run ./cmd/nokv migrate init \
+  --workdir ./data/store-1 \
+  --store 1 \
+  --region 1 \
+  --peer 101
+
+# 3. Start the promoted workdir in distributed mode
+go run ./cmd/nokv serve \
+  --workdir ./data/store-1 \
+  --store-id 1 \
+  --coordinator-addr 127.0.0.1:2379
+
+# 4. Expand the seed into more replicas
+go run ./cmd/nokv migrate expand \
+  --addr 127.0.0.1:20170 \
+  --region 1 \
+  --target 2:201@127.0.0.1:20171 \
+  --target 3:301@127.0.0.1:20172
+</code></pre>
+<h3 id="local-operator-wrapper"><a class="header" href="#local-operator-wrapper">Local operator wrapper</a></h3>
+<p>For local demos and operator workflows, the happy path is wrapped by:</p>
 <ul>
-<li>Bloom filters are stored inside <code>pb.TableIndex</code> and probed directly from the decoded index already held by <code>table.idx</code>.</li>
-<li>There is no separate bloom-filter cache layer; this avoids a redundant hot-path mutex/LRU hop on every point lookup.</li>
-<li><code>indexCache</code> keeps the existing W-TinyLFU admission path and budgets decoded <code>pb.TableIndex</code> payloads using the protobuf-encoded size (<code>proto.Size</code>).</li>
+<li><code>scripts/ops/migrate-cluster.sh</code></li>
 </ul>
-<hr>
-<h2 id="4-metrics--observability"><a class="header" href="#4-metrics--observability">4. Metrics &amp; Observability</a></h2>
-<p><code>cache.metricsSnapshot()</code> produces:</p>
-<pre><code class="language-go">type CacheMetrics struct {
-    L0Hits, L0Misses uint64
-    L1Hits, L1Misses uint64
-    IndexHits, IndexMisses uint64
+<p>That wrapper intentionally delegates state transitions to the formal migration CLI instead of inventing a second control path.
+It now prints stage banners, shows the local migration status after promotion, and writes final migration reports under:</p>
+<ul>
+<li><code>artifacts/migration/summary.txt</code></li>
+<li><code>artifacts/migration/summary.json</code></li>
+</ul>
+<p>For local inspection and automation, the CLI also exposes:</p>
+<ul>
+<li><code>nokv migrate status --workdir ...</code></li>
+<li><code>nokv migrate report --workdir ...</code></li>
+<li><code>nokv migrate status --workdir ... --addr &lt;leader-admin&gt; --region &lt;region&gt;</code></li>
+<li><code>nokv migrate report --workdir ... --addr &lt;leader-admin&gt; --region &lt;region&gt;</code></li>
+</ul>
+<p>When <code>--addr</code> is set, the report includes a cluster-aware runtime view:</p>
+<ul>
+<li>current leader peer</li>
+<li>current leader store</li>
+<li>whether the local store is hosted</li>
+<li>current membership size</li>
+<li>membership peer list</li>
+<li>applied index / term on that store</li>
+</ul>
+<h2 id="lifecycle-states"><a class="header" href="#lifecycle-states">Lifecycle States</a></h2>
+<pre class="mermaid">stateDiagram-v2
+    [*] --&gt; standalone
+    standalone --&gt; preparing: migrate init
+    preparing --&gt; seeded: catalog + seed snapshot + raft seed
+    seeded --&gt; cluster: first successful serve
+    cluster --&gt; cluster: expand / transfer-leader / remove-peer
+</pre>
+
+<h3 id="workdir-modes"><a class="header" href="#workdir-modes">Workdir modes</a></h3>
+<p>The promoted workdir exposes an explicit mode contract:</p>
+<ul>
+<li><code>standalone</code></li>
+<li><code>preparing</code></li>
+<li><code>seeded</code></li>
+<li><code>cluster</code></li>
+</ul>
+<p>Minimal persisted state looks like this:</p>
+<pre><code class="language-json">{
+  "mode": "seeded",
+  "store_id": 1,
+  "region_id": 1,
+  "peer_id": 101
 }
 </code></pre>
-<p><code>Stats.Snapshot</code> converts these into hit rates. Monitor them alongside the block cache sizes to decide when to scale memory.</p>
-<hr>
-<h2 id="5-hotring-integration"><a class="header" href="#5-hotring-integration">5. HotRing Integration</a></h2>
-<p>HotRing is no longer part of cache warmup or read-path prefetch. Cache behavior is now independent of HotRing and driven only by:</p>
+<h3 id="semantics"><a class="header" href="#semantics">Semantics</a></h3>
 <ul>
-<li>iterator/table prefetch settings</li>
-<li>block/index cache budgets</li>
-<li>normal read traffic</li>
-</ul>
-<p>The only remaining HotRing integration is optional write throttling.</p>
-<hr>
-<h2 id="6-interaction-with-value-log"><a class="header" href="#6-interaction-with-value-log">6. Interaction with Value Log</a></h2>
+<li><code>standalone</code>
 <ul>
-<li>Keys stored as value pointers (large values) still populate block cache entries for the key/index block. The value payload is read directly from the vlog (<code>valueLog.read</code>), so block cache hit rates remain meaningful.</li>
-<li>Discard stats from flushes can demote cached blocks via <code>cache.dropBlock</code>, ensuring obsolete SST data leaves the cache quickly.</li>
+<li>regular standalone engine directory</li>
 </ul>
-<hr>
-<h2 id="7-comparison"><a class="header" href="#7-comparison">7. Comparison</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Feature</th><th>RocksDB</th><th>BadgerDB</th><th>NoKV</th></tr>
-</thead>
-<tbody>
-<tr><td>Block cache policy</td><td>Configurable multiple caches</td><td>Single cache</td><td>Ristretto for L0/L1 + OS page cache for deeper levels</td></tr>
-<tr><td>Bloom filter storage</td><td>Per table</td><td>Per table</td><td>Embedded in decoded table indexes</td></tr>
-<tr><td>Metrics</td><td>Block cache stats via <code>GetAggregatedIntProperty</code></td><td>Limited</td><td><code>NoKV.Stats.cache.*</code> hit rates</td></tr>
-</tbody>
-</table>
-</div>
-<hr>
-<h2 id="8-operational-tips"><a class="header" href="#8-operational-tips">8. Operational Tips</a></h2>
+</li>
+<li><code>preparing</code>
 <ul>
-<li>If point-read false positives become expensive, tune bloom bits-per-key at SST build time rather than adding another filter cache layer.</li>
-<li>Track <code>nokv stats --json</code> cache metrics over time; drops often indicate iterator misuse or working-set shifts.</li>
-<li>Benchmark tooling accepts cache sizes in MB and converts them into these byte-budget fields before opening the engine.</li>
+<li>migration is in progress; ordinary standalone open must refuse service</li>
 </ul>
-<p>More on SST layout lives in <a href="manifest.html"><code>docs/manifest.md</code></a> and <a href="architecture.html#4-read-path--iterators"><code>docs/architecture.md</code></a>.</p>
+</li>
+<li><code>seeded</code>
+<ul>
+<li>the standalone workdir has been promoted into a valid single-store cluster seed</li>
+</ul>
+</li>
+<li><code>cluster</code>
+<ul>
+<li>the workdir is now operating through the distributed runtime</li>
+</ul>
+</li>
+</ul>
+<p>That mode gate is one of the most important engineering choices in the feature. It prevents a half-migrated directory from being silently treated as a normal local database.</p>
+<h3 id="local-promotion-checkpoint"><a class="header" href="#local-promotion-checkpoint">Local promotion checkpoint</a></h3>
+<p>During <code>migrate init</code>, NoKV now persists a lightweight local checkpoint alongside the mode file.
+That checkpoint records which milestone of the standalone-to-seed promotion has already completed, for example:</p>
+<ul>
+<li><code>mode-preparing-written</code></li>
+<li><code>local-catalog-persisted</code></li>
+<li><code>seed-snapshot-exported</code></li>
+<li><code>raft-seed-initialized</code></li>
+<li><code>seeded-finalized</code></li>
+</ul>
+<p><code>nokv migrate status</code> and <code>nokv migrate report</code> surface this checkpoint together with a <code>resume_hint</code>, so interrupted promotion is no longer just “stuck in preparing” without context.</p>
+<p>When <code>nokv migrate expand</code>, <code>nokv migrate transfer-leader</code>, or <code>nokv migrate remove-peer</code> is invoked with <code>--workdir</code>, the same checkpoint file is also updated with operator progress:</p>
+<ul>
+<li>which target store/peer is currently being rolled out</li>
+<li>how many targets have already completed hosting</li>
+<li>which leader transfer or peer removal step just completed</li>
+<li>what migration command should be retried next after an interruption</li>
+</ul>
+<h3 id="post-step-validation"><a class="header" href="#post-step-validation">Post-step validation</a></h3>
+<p>Migration commands now also validate the state they just created instead of trusting only the immediate RPC return:</p>
+<ul>
+<li><code>migrate init</code> verifies the local catalog, seed snapshot manifest, and local raft pointer all agree on the promoted seed region</li>
+<li><code>migrate expand</code> verifies leader membership and target hosted state agree on the new peer</li>
+<li><code>migrate transfer-leader</code> verifies the elected leader and target runtime converge on the requested peer</li>
+<li><code>migrate remove-peer</code> verifies leader metadata and target runtime both stop advertising the removed peer</li>
+</ul>
+<h2 id="what-actually-happens"><a class="header" href="#what-actually-happens">What Actually Happens</a></h2>
+<p>The migration path is easier to reason about if you separate the steps by ownership.</p>
+<h3 id="1-plan-preflight-only"><a class="header" href="#1-plan-preflight-only">1. <code>plan</code>: preflight only</a></h3>
+<p><code>nokv migrate plan</code> is read-only. It checks:</p>
+<ul>
+<li>the standalone workdir is readable</li>
+<li>recovery state is coherent enough to promote</li>
+<li>the directory is not already seeded or clustered</li>
+<li>there is no conflicting local peer catalog</li>
+<li>the directory is not already poisoned by an incompatible state</li>
+</ul>
+<p>No mutation happens here.</p>
+<h3 id="2-init-promote-the-workdir-into-a-seed"><a class="header" href="#2-init-promote-the-workdir-into-a-seed">2. <code>init</code>: promote the workdir into a seed</a></h3>
+<p><code>nokv migrate init</code> performs the actual promotion.</p>
+<p>At a high level it does this:</p>
+<ol>
+<li>write mode = <code>preparing</code></li>
+<li>persist a full-range local <code>RegionMeta</code> in <code>raftstore/localmeta</code></li>
+<li>export one full-range SST seed snapshot from the standalone DB</li>
+<li>synthesize the initial raft durable state for a single local voter</li>
+<li>persist the local raft replay pointer</li>
+<li>write mode = <code>seeded</code></li>
+</ol>
+<h3 id="3-serve-reuse-the-normal-distributed-startup-path"><a class="header" href="#3-serve-reuse-the-normal-distributed-startup-path">3. <code>serve</code>: reuse the normal distributed startup path</a></h3>
+<p>After <code>init</code>, the promoted directory is not started through a special bootstrap runtime. It is opened through normal distributed startup:</p>
+<ul>
+<li>open the same DB workdir</li>
+<li>load local recovery metadata from <code>raftstore/localmeta</code></li>
+<li>open group-local raft durable state</li>
+<li>start one local peer</li>
+<li>serve distributed traffic through the regular raftstore path</li>
+</ul>
+<p>That is what keeps the feature architecturally honest.</p>
+<h3 id="4-expand-reuse-normal-replication-mechanisms"><a class="header" href="#4-expand-reuse-normal-replication-mechanisms">4. <code>expand</code>: reuse normal replication mechanisms</a></h3>
+<p>Once the seed is healthy, normal distributed mechanisms take over:</p>
+<ol>
+<li>start empty target stores</li>
+<li>call <code>nokv migrate expand</code> against the current leader</li>
+<li>leader exports one SST snapshot stream</li>
+<li>target imports the streamed snapshot on an empty peer</li>
+<li>leader publishes the new membership</li>
+<li>wait until the target store reports the peer as hosted</li>
+</ol>
+<p>The current implementation keeps rollout explicit and sequential:</p>
+<ul>
+<li>repeated <code>--target &lt;store&gt;:&lt;peer&gt;[@addr]</code></li>
+<li>explicit <code>transfer-leader</code></li>
+<li>explicit <code>remove-peer</code></li>
+<li>no automatic split or rebalance in the promotion phase</li>
+</ul>
+<h2 id="snapshot-semantics"><a class="header" href="#snapshot-semantics">Snapshot Semantics</a></h2>
+<p>This feature matters because migration is not implemented as a file dump or a second storage engine.</p>
+<h3 id="current-snapshot-path"><a class="header" href="#current-snapshot-path">Current snapshot path</a></h3>
+<p>Today NoKV’s migration path uses one SST region snapshot primitive:</p>
+<ul>
+<li>source side exports one region-scoped external SST snapshot</li>
+<li>snapshot files are bundled into a transport-safe payload</li>
+<li>target side imports that payload through the external SST install path</li>
+<li>internal raft snapshot transport carries the same SST payload when a peer
+needs snapshot-based catch-up instead of regular log replication</li>
+</ul>
+<p>This is a correctness-first choice.</p>
+<h3 id="why-that-choice-is-reasonable-right-now"><a class="header" href="#why-that-choice-is-reasonable-right-now">Why that choice is reasonable right now</a></h3>
+<p>It keeps the promotion and replication contract simple enough to validate:</p>
+<ul>
+<li>region-scoped</li>
+<li>explicit snapshot metadata and checksum</li>
+<li>install-before-publish boundaries</li>
+<li>retry and restart semantics that are testable</li>
+</ul>
+<h3 id="what-this-is-not-trying-to-be-yet"><a class="header" href="#what-this-is-not-trying-to-be-yet">What this is not trying to be yet</a></h3>
+<p>The current path is not pretending to be:</p>
+<ul>
+<li>zero-copy table transfer</li>
+<li>SST ingest-based install</li>
+<li>online rebalance for already sharded data</li>
+</ul>
+<p>Those are later upgrades, not prerequisites for the first credible promotion path.</p>
+<h2 id="why-full-range-seed-first"><a class="header" href="#why-full-range-seed-first">Why Full-Range Seed First</a></h2>
+<p>The first promotion step intentionally creates one full-range seed region:</p>
+<ul>
+<li><code>StartKey = nil</code></li>
+<li><code>EndKey = nil</code></li>
+</ul>
+<p>That means the migration feature does <strong>not</strong> need to solve split and rebalance as part of the first upgrade.</p>
+<p>This is a good tradeoff.</p>
+<p>The first hard problem is not “how to repartition existing data automatically”. The first hard problem is “how to make one existing standalone directory become a valid distributed region with explicit lifecycle and recovery semantics”.</p>
+<p>Once that is solid, later split and rebalance work can build on top of a stable seed region instead of being entangled with promotion itself.</p>
+<h2 id="failure-semantics"><a class="header" href="#failure-semantics">Failure Semantics</a></h2>
+<p>The migration flow must fail loudly and remain recoverable.</p>
+<h3 id="during-plan"><a class="header" href="#during-plan">During <code>plan</code></a></h3>
+<ul>
+<li>read-only errors are returned directly</li>
+</ul>
+<h3 id="during-init"><a class="header" href="#during-init">During <code>init</code></a></h3>
+<p>If any step after <code>preparing</code> fails:</p>
+<ul>
+<li>keep mode as <code>preparing</code></li>
+<li>reject ordinary standalone startup</li>
+<li>require explicit operator action:
+<ul>
+<li>rerun <code>init</code>, or</li>
+<li>use a future rollback or repair path</li>
+</ul>
+</li>
+</ul>
+<p>This is intentionally strict. Half-migrated state must not quietly behave like a normal standalone database.</p>
+<h3 id="during-expand"><a class="header" href="#during-expand">During <code>expand</code></a></h3>
+<p>Expansion should not be treated as “best effort copy”. It should remain observable and explicit:</p>
+<ul>
+<li>leader publication must become visible</li>
+<li>target install must become hosted</li>
+<li>interruption before publish must not leave a partially hosted peer</li>
+<li>restart after install must converge without ghost peers</li>
+</ul>
+<p>That is why the current test matrix includes:</p>
+<ul>
+<li>snapshot interruption before publish</li>
+<li>restarted follower recovery</li>
+<li>removed-peer restart</li>
+<li>repeated transport flap during membership changes</li>
+<li>Coordinator outage after startup</li>
+</ul>
+<h2 id="test-and-validation-story"><a class="header" href="#test-and-validation-story">Test and Validation Story</a></h2>
+<p>This feature only counts if it is validated as a lifecycle, not just as a command list.</p>
+<p>The current validation story spans:</p>
+<ul>
+<li><code>raftstore/migrate/*_test.go</code>
+<ul>
+<li>migration orchestration and timeout behavior</li>
+</ul>
+</li>
+<li><code>raftstore/admin/service_test.go</code>
+<ul>
+<li>admin execution surfaces for snapshot export/install</li>
+</ul>
+</li>
+<li><code>raftstore/store/peer_lifecycle_test.go</code>
+<ul>
+<li>install and publish semantics on the target side</li>
+</ul>
+</li>
+<li><code>raftstore/integration/migration_flow_test.go</code>
+<ul>
+<li>standalone → seed → cluster happy path</li>
+</ul>
+</li>
+<li><code>raftstore/integration/restart_recovery_test.go</code>
+<ul>
+<li>restart, dehost, and follow-up membership behavior</li>
+</ul>
+</li>
+<li><code>raftstore/integration/snapshot_interruption_test.go</code>
+<ul>
+<li>install interrupted before publish</li>
+</ul>
+</li>
+<li><code>raftstore/integration/pd_degraded_test.go</code>
+<ul>
+<li>control-plane degradation after startup</li>
+</ul>
+</li>
+</ul>
+<p>That is the right level of seriousness for the feature. Migration is one of the easiest places for a system to look good in a demo and fail under recovery.</p>
+<h2 id="current-scope-and-non-goals"><a class="header" href="#current-scope-and-non-goals">Current Scope and Non-goals</a></h2>
+<p>The first version is intentionally narrow.</p>
+<h3 id="in-scope-now"><a class="header" href="#in-scope-now">In scope now</a></h3>
+<ul>
+<li>offline standalone → seed promotion</li>
+<li>one full-range seed region</li>
+<li>explicit <code>plan/init/status/expand/remove-peer/transfer-leader</code></li>
+<li>SST region snapshot export/install</li>
+<li>recovery-aware mode gating</li>
+</ul>
+<h3 id="not-in-scope-yet"><a class="header" href="#not-in-scope-yet">Not in scope yet</a></h3>
+<ul>
+<li>online cutover</li>
+<li>dual-write</li>
+<li>automatic split/rebalance during promotion</li>
+<li>automatic cluster-wide orchestration</li>
+<li>SST-based snapshot/install as the default path</li>
+</ul>
+<p>Keeping the scope narrow is part of what makes the feature credible.</p>
+<h2 id="what-comes-next"><a class="header" href="#what-comes-next">What Comes Next</a></h2>
+<p>The next round of work should not reinvent the protocol. It should productize and sharpen it.</p>
+<h3 id="near-term-productization"><a class="header" href="#near-term-productization">Near-term productization</a></h3>
+<ol>
+<li>richer cluster-aware migration status once the seed has booted</li>
+<li>structured machine-readable reports that can be consumed by demos and automation</li>
+<li>stronger stage-by-stage operator output in <code>scripts/ops/migrate-cluster.sh</code></li>
+<li>clearer recovery guidance for <code>preparing</code>, interrupted install, and partial rollout</li>
+</ol>
+<h3 id="next-engineering-upgrade"><a class="header" href="#next-engineering-upgrade">Next engineering upgrade</a></h3>
+<p>The most important technical upgrade after that is:</p>
+<ul>
+<li><strong>SST-based snapshot/install for promotion and peer rollout</strong></li>
+</ul>
+<p>But that should be treated as an upgrade to the existing migration contract, not a replacement for the contract itself.</p>
+<h3 id="long-term-direction"><a class="header" href="#long-term-direction">Long-term direction</a></h3>
+<p>Once standalone → full-range seed → replicated region is solid and easy to operate, later work can move on to:</p>
+<ul>
+<li>more automated orchestration</li>
+<li>region split after promotion</li>
+<li>richer rebalance flows</li>
+<li>larger-scale rollout behavior</li>
+</ul>
+<h2 id="the-feature-in-one-sentence"><a class="header" href="#the-feature-in-one-sentence">The Feature in One Sentence</a></h2>
+<p>NoKV starts with a standalone workdir, promotes that workdir into a distributed seed, and expands it into a replicated cluster without replacing the storage core underneath.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="file.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="control_and_execution_protocols.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="range_filter.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="recovery.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -294,11 +612,11 @@ Deeper levels rely on OS page cache + mmap readahead
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="file.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="control_and_execution_protocols.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="range_filter.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="recovery.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

@@ -8,7 +8,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="">
+        <meta name="description" content="NoKV design, architecture, migration, and testing documentation.">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="docs/custom-7218a61a.css">
+        <link rel="stylesheet" href="docs/custom-a69f6233.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6fdcf697.js";
+            window.path_to_searchindex_js = "searchindex-01a1bb3c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-5ff2b812.js"></script>
+        <script src="toc-b8f8ac3b.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -187,10 +187,21 @@
 <li>(Optional) Docker + Docker Compose for containerized runs</li>
 </ul>
 <h2 id="option-a-local-cluster-recommended-for-dev"><a class="header" href="#option-a-local-cluster-recommended-for-dev">Option A: Local Cluster (recommended for dev)</a></h2>
-<p>This launches a 3-node Raft cluster plus a PD-lite service.</p>
-<pre><code class="language-bash">./scripts/run_local_cluster.sh --config ./raft_config.example.json
+<p>This launches a 3-node Raft cluster plus a Coordinator service.</p>
+<pre><code class="language-bash">./scripts/dev/cluster.sh --config ./raft_config.example.json
 </code></pre>
-<p>The launcher stays attached, streams PD/store logs to the terminal, and also writes them under <code>./artifacts/cluster/</code>.</p>
+<p>The launcher stays attached, streams Coordinator/store logs to the terminal, and also writes them under <code>./artifacts/cluster/</code>.</p>
+<p>If you stop one store and want to restart it later, restart it against the same
+workdir:</p>
+<pre><code class="language-bash">./scripts/ops/serve-store.sh \
+  --config ./raft_config.example.json \
+  --store-id 1 \
+  --workdir ./artifacts/cluster/store-1
+</code></pre>
+<p>On restart, NoKV recovers hosted peers from local metadata in the store workdir.
+The config file is only used to resolve store and Coordinator addresses.
+Do not rerun <code>scripts/ops/bootstrap.sh</code> or treat <code>scripts/dev/cluster.sh</code> as the
+restart path for an already-running store.</p>
 <p>Start the Redis-compatible gateway in another shell:</p>
 <pre><code class="language-bash">go run ./cmd/nokv-redis --addr 127.0.0.1:6380 --raft-config raft_config.example.json
 </code></pre>
@@ -222,7 +233,10 @@ func main() {
 	opt := NoKV.NewDefaultOptions()
 	opt.WorkDir = "./workdir-demo"
 
-	db := NoKV.Open(opt)
+	db, err := NoKV.Open(opt)
+	if err != nil {
+		log.Fatalf("open failed: %v", err)
+	}
 	defer db.Close()
 
 	key := []byte("hello")
@@ -320,6 +334,7 @@ func main() {
         <script src="book-a0b12cfe.js"></script>
 
         <!-- Custom JS scripts -->
+        <script src="docs/custom-732fa610.js"></script>
         <script src="docs/mermaid-init-8a66ee6c.js"></script>
 
 
